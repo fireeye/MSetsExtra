@@ -19,6 +19,12 @@
  * If not, see <http://www.gnu.org/licenses/>.
  *)
 
+(* CHANGES
+ *
+ * 25-09-2016 Thomas Tuerk <thomas@tuerk-brechen.de>
+ *   implement union, inter, diff, subset, choose efficiently
+ *)
+
 (** * Weak sets implemented by interval lists 
 
     This file contains an implementation of the weak set interface
@@ -54,6 +60,44 @@ Proof.
   }
   apply Zplus_le_compat_l.
   apply N2Z.is_nonneg.
+Qed.
+
+Lemma Z_lt_add_r : forall (z : Z) (n : N),
+  (n <> 0)%N ->
+  z < z + Z.of_N n.
+Proof.
+  move => z n H_neq_0.
+  suff : (z + Z.of_N 0 < z + Z.of_N n). {
+    rewrite Z.add_0_r //.
+  }
+  apply Z.add_lt_mono_l, N2Z.inj_lt.
+  by apply N.neq_0_lt_0.
+Qed.
+
+Lemma Z_lt_le_add_r : forall y1 y2 c, 
+  y1 < y2 ->
+  y1 <= y2 + Z.of_N c.
+Proof.
+  intros y1 y2 c H.
+  apply Z.le_trans with (m := y2). {
+    by apply Z.lt_le_incl.
+  } {
+    apply Z_le_add_r.
+  }
+Qed.
+
+Lemma Z_to_N_minus_neq_0 : forall (x y : Z),
+    y < x ->
+    Z.to_N (x - y) <> 0%N.
+Proof.
+  intros x y H_y_lt.
+  apply N.neq_0_lt_0.
+  apply N2Z.inj_lt.
+  suff H :  0 < x - y. {
+    rewrite Z2N.id => //.
+    by apply Z.lt_le_incl.
+  }
+  by apply Z.lt_0_sub.
 Qed.
 
 Lemma add_add_sub_eq : forall (x y : Z), (x + (y - x) = y). 
@@ -190,7 +234,7 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
   Definition empty : t := nil.
   Definition is_empty (l : t) := match l with nil => true | _ => false end.
 
-  
+ 
   (** Defining the list of elements, is much more tricky, especially, 
       if it needs to be executable. *) 
   Lemma acc_pred : forall n p, n = Npos p -> Acc N.lt n -> Acc N.lt (N.pred n).
@@ -207,8 +251,6 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
     | N0 => fun _ => acc
     | c => fun Heq => elementsZ_aux'' (x::acc) (Z.succ x) (N.pred c) (acc_pred _ _ Heq H)
     end (refl_equal _).
-
-  Extraction Inline elementsZ_aux''.
 
   Definition elementsZ_aux' acc x c := elementsZ_aux'' acc x c (lt_wf_0 _).
 
@@ -238,26 +280,83 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
 
   Definition mem (x : elt) (s : t) := memZ (Enc.encode x) s.
 
+  (** Comparing intervals *)
+  Inductive interval_compare_result := 
+      ICR_before
+    | ICR_before_touch
+    | ICR_overlap_before 
+    | ICR_overlap_after
+    | ICR_equal
+    | ICR_subsume_1
+    | ICR_subsume_2
+    | ICR_after
+    | ICR_after_touch.
+
+  Definition interval_compare (i1 i2 : (Z * N)) : interval_compare_result := 
+    match (i1, i2) with ((y1, c1), (y2, c2)) => 
+      let yc2 := (y2+Z.of_N c2) in
+      match (Z.compare yc2 y1) with
+        | Lt => ICR_after
+        | Eq => ICR_after_touch
+        | Gt => let yc1 := (y1+Z.of_N c1) in
+                match (Z.compare yc1 y2) with
+                | Lt => ICR_before
+                | Eq => ICR_before_touch
+                | Gt => (* y2 < y1+c1 /\ y1 < y2 + c2 *)
+                        match (Z.compare y1 y2, Z.compare yc1 yc2) with
+                        | (Lt, Lt) => ICR_overlap_before
+                        | (Lt, _) => ICR_subsume_2
+                        | (Eq, Lt) => ICR_subsume_1
+                        | (Eq, Gt) => ICR_subsume_2
+                        | (Eq, Eq) => ICR_equal
+                        | (Gt, Gt) => ICR_overlap_after
+                        | (Gt, _) => ICR_subsume_1
+                        end
+                end
+      end
+    end.
+
+  Definition interval_1_compare (y1 : Z) (i : (Z * N)) : interval_compare_result := 
+    match i with (y2, c2) => 
+      let yc2 := (y2+Z.of_N c2) in
+      match (Z.compare yc2 y1) with
+        | Lt => ICR_after
+        | Eq => ICR_after_touch
+        | Gt => match (Z.compare (Z.succ y1) y2) with
+                | Lt => ICR_before 
+                | Eq => ICR_before_touch
+                | Gt => ICR_subsume_1
+                end
+      end
+    end.
+
+  (** Auxiliary functions for inserting at front and merging intervals *)
+  Definition merge_interval_size (x1 : Z) (c1 : N) (x2 : Z) (c2 : N) : N :=
+    (N.max c1 (Z.to_N (x2 + Z.of_N c2 - x1))).
+
+  Fixpoint insert_interval_begin (x : Z) (c : N) (l : t) := 
+    match l with
+    | nil => (x,c)::nil
+    | (y, c')::l' => 
+         match (Z.compare (x + Z.of_N c) y) with
+         | Lt => (x, c) :: l
+         | Eq => (x, (c+c')%N) :: l'
+         | Gt => insert_interval_begin x (merge_interval_size x c y c') l'
+         end
+    end.
+
   (** adding an element needs to be defined carefully again in order to
       generate efficient code *)
   Fixpoint addZ_aux (acc : list (Z * N)) (x : Z) (s : t) :=
     match s with
     | nil => List.rev' ((x, (1%N))::acc)
     | (y, c) :: l =>
-        match (Z.compare (Z.succ x) y) with
-        | Lt => List.rev_append ((x, (1%N))::acc) s
-        | Eq => List.rev_append ((x, N.succ c)::acc) l
-        | Gt => match (Z.compare x (y+Z.of_N c)) with
-                 | Lt => List.rev_append acc s
-                 | Gt => addZ_aux ((y,c) :: acc) x l
-                 | Eq => match l with
-                           | nil => List.rev' ((y, N.succ c)::acc) 
-                           | (z, c') :: l' => if (Z.eqb z (Z.succ x)) then
-                                List.rev_append ((y,N.succ (c+c')) :: acc) l'
-                             else
-                                List.rev_append ((y,N.succ c) :: acc) l
-                         end
-                end                 
+        match (interval_1_compare x (y,c)) with
+          | ICR_before       => List.rev_append ((x, (1%N))::acc) s
+          | ICR_before_touch => List.rev_append ((x, N.succ c)::acc) l
+          | ICR_after        => addZ_aux ((y,c) :: acc) x l
+          | ICR_after_touch  => List.rev_append acc (insert_interval_begin y (N.succ c) l)
+          | _  => List.rev_append ((y, c)::acc) l
         end
     end.
 
@@ -279,7 +378,7 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
 
 
   (** removing needs to be done with code extraction in mind again. *)
-  Definition removeZ_aux_insert_guarded (x : Z) (c : N) s :=
+  Definition insert_intervalZ_guarded (x : Z) (c : N) s :=
      if (N.eqb c 0) then s else (x, c) :: s.
 
   Fixpoint removeZ_aux (acc : list (Z * N)) (x : Z) (s : t) : t :=
@@ -288,9 +387,9 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
     | (y, c) :: l =>
         if (Z.ltb x y) then List.rev_append acc s else
         if (Z.ltb x (y+Z.of_N c)) then (
-           List.rev_append (removeZ_aux_insert_guarded (Z.succ x) 
+           List.rev_append (insert_intervalZ_guarded (Z.succ x) 
               (Z.to_N ((y+Z.of_N c)- (Z.succ x))) 
-             (removeZ_aux_insert_guarded y (Z.to_N (x-y)) acc)) l
+             (insert_intervalZ_guarded y (Z.to_N (x-y)) acc)) l
         ) else removeZ_aux ((y,c)::acc) x l
     end.
 
@@ -300,29 +399,129 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
   Definition remove_list (l : list elt) (s : t) : t :=
      List.fold_left (fun s x => remove x s) l s.
 
-  (** all other operations are defined trivially (if not always efficiently)
-      in terms of already defined ones. In the future it might be worth implementing
-      some of them more efficiently. *)
-  Definition union (s1 s2 : t) :=
-    add_list (elements s1) s2.
+  (** union *)
+  Fixpoint union_aux (s1 : t) :=
+    fix aux (s2 : t) (acc : list (Z * N)) :=
+    match (s1, s2) with
+    | (nil, _) => List.rev_append acc s2
+    | (_, nil) => List.rev_append acc s1
+    | ((y1, c1) :: l1, (y2, c2) :: l2) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => union_aux l1 s2 ((y1, c1)::acc)
+          | ICR_before_touch => 
+              union_aux l1 (
+               insert_interval_begin y1 ((c1+c2)%N) l2) acc
+          | ICR_after        => aux l2 ((y2, c2)::acc)
+          | ICR_after_touch  => union_aux l1 (
+              insert_interval_begin y2 ((c1+c2)%N) l2) acc
+          | ICR_overlap_before => 
+              union_aux l1 (insert_interval_begin y1 (merge_interval_size y1 c1 y2 c2) l2) acc
+          | ICR_overlap_after => 
+              union_aux l1 (insert_interval_begin y2 (merge_interval_size y2 c2 y1 c1) l2) acc
+          | ICR_equal => union_aux l1 s2 acc
+          | ICR_subsume_1 => union_aux l1 s2 acc
+          | ICR_subsume_2 => aux l2 acc
+        end
+    end.
 
-  Definition filter (f : elt -> bool) (s : t) : t :=
-    from_elements (List.filter f (elements s)).
+  Definition union s1 s2 := union_aux s1 s2 nil.
 
-  Definition inter (s1 s2 : t) : t :=
-    filter (fun x => mem x s2) s1.
+  (** diff *)
 
-  Definition diff (s1 s2 : t) : t :=
-    remove_list (elements s2) s1.
 
-  Definition subset s s' :=
-    List.forallb (fun x => mem x s') (elements s).
+  Fixpoint diff_aux (y2 : Z) (c2 : N) (acc : list (Z * N)) (s : t) : (list (Z * N) * t) :=
+    match s with
+    | nil => (acc, nil)
+    | ((y1, c1) :: l1) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => diff_aux y2 c2 ((y1, c1)::acc) l1
+          | ICR_before_touch => diff_aux y2 c2 ((y1, c1)::acc) l1
+          | ICR_after        => (acc, s)
+          | ICR_after_touch  => (acc, s)
+          | ICR_overlap_before => diff_aux y2 c2 ((y1, Z.to_N (y2 - y1))::acc) l1
+          | ICR_overlap_after => (acc, (y2+Z.of_N c2, Z.to_N ((y1 + Z.of_N c1) - (y2 + Z.of_N c2))) :: l1)
+          | ICR_equal => (acc, l1)
+          | ICR_subsume_1 => diff_aux y2 c2 acc l1
+          | ICR_subsume_2 => ((insert_intervalZ_guarded y1
+                (Z.to_N (y2 - y1)) acc), 
+              insert_intervalZ_guarded (y2+Z.of_N c2) (Z.to_N ((y1 + Z.of_N c1) - (y2 + Z.of_N c2))) l1) 
+        end
+    end.
 
+  Fixpoint diff_aux2 (acc : list (Z * N)) (s1 s2 : t) : (list (Z * N)) :=
+    match (s1, s2) with
+    | (nil, _) => rev_append acc s1
+    | (_, nil) => rev_append acc s1
+    | (_, (y2, c2) :: l2) =>
+      match diff_aux y2 c2 acc s1 with
+        (acc', s1') => diff_aux2 acc' s1' l2
+      end
+    end.
+
+  Definition diff s1 s2 := diff_aux2 nil s1 s2.
+  
+  (** subset *)
+  Fixpoint subset (s1 : t) :=
+    fix aux (s2 : t) :=
+    match (s1, s2) with
+    | (nil, _) => true
+    | (_ :: _, nil) => false
+    | ((y1, c1) :: l1, (y2, c2) :: l2) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => false
+          | ICR_before_touch => false
+          | ICR_after        => aux l2 
+          | ICR_after_touch  => false
+          | ICR_overlap_before => false
+          | ICR_overlap_after => false
+          | ICR_equal => subset l1 l2
+          | ICR_subsume_1 => subset l1 s2
+          | ICR_subsume_2 => false
+        end
+    end.
+
+  (** equal *)
   Fixpoint equal (s s' : t) : bool := match s, s' with
     | nil, nil => true
     | ((x,cx)::xs), ((y,cy)::ys) => andb (Z.eqb x y) (andb (N.eqb cx cy) (equal xs ys))
     | _, _ => false
   end. 
+
+  (** inter *)
+  Fixpoint inter_aux (y2 : Z) (c2 : N) (acc : list (Z * N)) (s : t) : (list (Z * N) * t) :=
+    match s with
+    | nil => (acc, nil)
+    | ((y1, c1) :: l1) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => inter_aux y2 c2 acc l1
+          | ICR_before_touch => inter_aux y2 c2 acc l1
+          | ICR_after        => (acc, s)
+          | ICR_after_touch  => (acc, s)
+          | ICR_overlap_before => inter_aux y2 c2 ((y2, Z.to_N (y1 + Z.of_N c1 - y2))::acc) l1
+          | ICR_overlap_after => ((y1, Z.to_N (y2 + Z.of_N c2 - y1))::acc, s)
+          | ICR_equal => ((y1,c1)::acc, l1)
+          | ICR_subsume_1 => inter_aux y2 c2 ((y1, c1)::acc) l1
+          | ICR_subsume_2 => ((y2, c2)::acc, s)
+        end
+    end.
+
+  Fixpoint inter_aux2 (acc : list (Z * N)) (s1 s2 : t) : (list (Z * N)) :=
+    match (s1, s2) with
+    | (nil, _) => List.rev' acc
+    | (_, nil) => List.rev' acc
+    | (_, (y2, c2) :: l2) =>
+      match inter_aux y2 c2 acc s1 with
+        (acc', s1') => inter_aux2 acc' s1' l2
+      end
+    end.
+
+  Definition inter s1 s2 := inter_aux2 nil s1 s2.
+
+  
+  (** Simple wrappers *)
+
+  Definition filter (f : elt -> bool) (s : t) : t :=
+    from_elements (List.filter f (elements s)).
 
   Definition fold {B : Type} (f : elt -> B -> B) (s : t) (i : B) : B :=
     List.fold_left (flip f) (elements s) i.
@@ -336,7 +535,6 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
   Definition partition (f : elt -> bool) (s : t) : t * t :=
     (filter f s, filter (fun x => negb (f x)) s).
 
-
   Fixpoint cardinalN c (s : t) : N := match s with
     | nil => c
     | (_,cx)::xs => cardinalN (c + cx)%N xs
@@ -345,15 +543,15 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
   Definition cardinal (s : t) : nat := N.to_nat (cardinalN (0%N) s).
 
   Definition chooseZ (s : t) : option Z :=
-    match List.rev' (elementsZ s) with
+    match s with
     | nil => None
-    | x :: _ => Some x
+    | (x, _) :: _ => Some x
     end.
 
   Definition choose (s : t) : option elt :=
-    match elements s with
-      | nil => None
-      | e :: _ => Some e
+    match (chooseZ s) with
+    | None => None
+    | Some x => Some (Enc.decode x)
     end.
 
 End Ops.
@@ -370,23 +568,23 @@ Module Raw (Enc : ElementEncode).
   Include (Ops Enc).
 
   (** *** Defining invariant [IsOk] *)
-
-  Definition inf (x:Z) (l: t) :=
-   match l with
-   | nil => true
-   | (y,_)::_ => Z.ltb x y
-   end.
-
-  Fixpoint isok (l : t) :=
-   match l with
-   | nil => true
-   | (x, c) ::l => inf (x+(Z.of_N c)) l && negb (N.eqb c 0) && isok l
-   end.
-
   Definition is_encoded_elems_list (l : list Z) : Prop :=
     (forall x, List.In x l -> exists e, Enc.encode e = x).
 
-  Definition IsOk s := (isok s = true /\ is_encoded_elems_list (elementsZ s)).
+  Definition interval_list_elements_greater (x : Z) (l : t) : bool :=
+    match l with 
+      | nil => true
+      | (y, _)::_ => Z.ltb x y 
+    end.
+
+  Fixpoint interval_list_invariant (l : t) :=
+   match l with
+   | nil => true
+   | (x, c) :: l' => 
+       interval_list_elements_greater (x + (Z.of_N c)) l' && negb (N.eqb c 0) && interval_list_invariant l'
+   end.
+
+  Definition IsOk s := (interval_list_invariant s = true /\ is_encoded_elems_list (elementsZ s)).
 
 
   (** *** Defining notations *)
@@ -453,7 +651,6 @@ Module Raw (Enc : ElementEncode).
     }
   Qed.
 
-
   Lemma elementsZ_single_succ_front : forall x c,
     elementsZ_single x (N.succ c) = 
     x :: elementsZ_single (Z.succ x) c.
@@ -471,32 +668,23 @@ Module Raw (Enc : ElementEncode).
     induction c as [| c' IH] using N.peano_ind. {
       intros y x.
       rewrite elementsZ_single_base Z.add_0_r /=.
-      split; first done.
-      move => [H_x_le H_y_lt].     
-      have := Z.le_lt_trans _ _ _ H_x_le H_y_lt.
-      apply Z.lt_irrefl.
+      omega.
     } {
       intros y x.
       rewrite elementsZ_single_succ in_app_iff IH /= N2Z.inj_succ Z.add_succ_r Z.lt_succ_r.
       split. {
-        move => []. {
-          move => [H_x_le H_y_le].
-          split; first done.
-          by apply Z.lt_le_incl.
-        }
-        move => [] // <-.
-        split. {
-          apply Z_le_add_r.
+        move => [ | []] //. { 
+          move => [H_x_le H_y_le]. 
+          omega.
         } {
-          by apply Z.le_refl.
+          move => <-.
+          split.
+            - by apply Z_le_add_r.
+            - by apply Z.le_refl.
         }
       } {
         move => [H_x_le] H_y_lt.
-        apply Z.lt_eq_cases in H_y_lt as [H_y_lt | <-]. {
-          by left. 
-        } {
-          by right; left.
-        }
+        omega.
       }
     }
   Qed.
@@ -506,13 +694,8 @@ Module Raw (Enc : ElementEncode).
     (x = y).
   Proof.
     intros y x.
-    rewrite In_elementsZ_single /= Z.add_1_r Z.lt_succ_r.
-    split. {
-      move => [? ?]. by apply Z.le_antisymm.
-    } {
-      move => ->.
-      split; apply Z.le_refl.
-    }
+    rewrite In_elementsZ_single /= Z.add_1_r Z.lt_succ_r. 
+    omega.
   Qed.
 
   Lemma length_elementsZ_single : forall cx x,
@@ -625,6 +808,83 @@ Module Raw (Enc : ElementEncode).
     rewrite !rev_map_alt_def map_app rev_app_distr map_rev rev_involutive //. 
   Qed.
 
+  Lemma elementsZ_app : forall (s1 s2 : t), elementsZ (s1 ++ s2) = 
+     ((elementsZ s2) ++ (elementsZ s1)). 
+  Proof. 
+    induction s1 as [| [x1 c1] s1 IH1]. {
+      move => s2.
+      rewrite elementsZ_nil app_nil_r //.
+    } 
+    move => s2.
+    rewrite -app_comm_cons !elementsZ_cons IH1 -app_assoc //.
+  Qed.
+
+  Lemma InZ_nil : forall y, InZ y nil <-> False. 
+  Proof. 
+    intro y.
+    done.
+  Qed.
+
+  Lemma InZ_cons : forall y x c s, InZ y (((x, c) :: s) : t) <-> 
+     List.In y (elementsZ_single x c) \/ InZ y s. 
+  Proof. 
+    intros y x c s.
+    rewrite /InZ elementsZ_cons in_app_iff -in_rev.
+    firstorder.
+  Qed.
+
+  Lemma InZ_app : forall s1 s2 y, 
+     InZ y (s1 ++ s2) <-> InZ y s1 \/ InZ y s2.
+  Proof. 
+    intros s1 s2 y.   
+    rewrite /InZ elementsZ_app in_app_iff.
+    tauto.
+  Qed.
+
+  Lemma InZ_rev : forall s y, 
+     InZ y (List.rev s) <-> InZ y s.
+  Proof. 
+    intros s x.
+    rewrite /InZ.
+    induction s as [| [y c] s' IH]; first done.
+    simpl.
+    rewrite elementsZ_app in_app_iff IH.
+    rewrite !elementsZ_cons !in_app_iff elementsZ_nil
+            -!in_rev /=.
+    tauto.
+  Qed.
+
+  Lemma In_elementsZ_single_dec : forall y x c,
+    {List.In y (elementsZ_single x c)} +
+    {~ List.In y (elementsZ_single x c)}.
+  Proof.  
+    intros y x c.
+    case (Z_le_dec x y); last first. {
+      right; rewrite In_elementsZ_single; tauto.
+    }
+    case (Z_lt_dec y (x + Z.of_N c)); last first. {
+      right; rewrite In_elementsZ_single; tauto.
+    }
+    left; rewrite In_elementsZ_single; tauto.
+  Qed.
+
+  Lemma InZ_dec : forall y s, 
+     {InZ y s} + {~InZ y s}.
+  Proof. 
+    intros y.
+    induction s as [| [x c] s IH]. {
+      by right.
+    }
+    move : IH => [] IH. {
+      by left; rewrite InZ_cons; right.
+    }
+    case (In_elementsZ_single_dec y x c). {
+      by left; rewrite InZ_cons; left.
+    } {
+      by right; rewrite InZ_cons; tauto.
+    }
+  Qed.
+
   Lemma In_elementsZ_single_hd : forall (c : N) x, (c <> 0)%N -> List.In x (elementsZ_single x c).
   Proof.
     intros c x H_c_neq.
@@ -640,274 +900,248 @@ Module Raw (Enc : ElementEncode).
   Qed.
 
 
-  (** *** Alternative definition of addZ *)
+  (** *** comparing intervals *)
 
-  (** [addZ] is defined with efficient execution in mind.
-      We derive first an alternative definition that demonstrates
-      the intention better and is better suited for proofs. *)
-  Lemma addZ_ind : 
-    forall (P : Z -> list (Z * N) -> Prop),
-       (* case s = nil *)
-       (forall (x : Z), P x nil) ->
+  Ltac Z_named_compare_cases H := match goal with
+    | [ |- context [Z.compare ?z1 ?z2] ] =>
+      case_eq (Z.compare z1 z2); [move => /Z.compare_eq_iff | move => /Z.compare_lt_iff | move => /Z.compare_gt_iff]; move => H //
+  end.
 
-       (* case s = [y, c] :: l, compare (x+1) y = Eq *)
-       (forall (x : Z)  (l : list (Z * N)) (c : N),
-        P x ((x + 1, c) :: l)) ->
-
-       (* case s = [y, c] :: l, compare (x+1) y = Lt *)       
-       (forall (x : Z) (l : list (Z * N)) (y : Z) (c : N),
-        (x + 1 ?= y) = Lt ->
-        P x ((y, c) :: l)) ->
-
-       (* case s = [y, c] :: l, compare (x+1) y = Gt, compare x (y+c) = Eq,
-           l = nil *)       
-       (forall (y : Z) (c : N),
-        ((y + Z.of_N c) + 1 ?= y) = Gt ->
-        P (y + Z.of_N c) ((y, c) :: nil)) ->
-
-       (* case s = (y, c) :: (z, c') :: l, compare (x+1) y = Gt, compare x (y+c) = Eq,
-          (z = x + 1) *)       
-       (forall (l : list (Z * N)) (y : Z) (c c' : N),
-        ((y + Z.of_N c) + 1 ?= y) = Gt ->
-        (P (y+Z.of_N c) l) ->
-        P (y+Z.of_N c) ((y, c) :: (((y+Z.of_N c) + 1, c') :: l))) ->
-
-       (* case s = (y, c) :: (z, c') :: l, compare (x+1) y = Gt, compare x (y+c) = Eq,
-          (z <> x + 1) *)       
-       (forall (l : list (Z * N)) (y : Z) (c : N) (z : Z) (c' : N),
-        ((y + Z.of_N c) + 1 ?= y) = Gt ->
-        (z =? (y+Z.of_N c) + 1) = false ->
-        (P (y+Z.of_N c) ((y, c) :: (z, c') :: l))) ->
-
-
-       (* case s = (y, c) :: l, compare (x+1) y = Gt, compare x (y+c) = Lt *)   
-       (forall (x : Z) (l : list (Z * N)) (y : Z) (c : N),
-        (x + 1 ?= y) = Gt ->
-        (x ?= y + Z.of_N c) = Lt -> 
-        P x ((y, c) :: l)) ->
-
-       (* case s = (y, c) :: l, compare (x+1) y = Gt, compare x (y+c) = Lt *)   
-       (forall (x : Z)(l : list (Z * N)) (y : Z) (c : N),
-        (x + 1 ?= y) = Gt ->
-        (x ?= y + (Z.of_N c)) = Gt ->
-        (P x l) ->
-        P x ((y, c) :: l)) ->
-
-
-       forall (x : Z) (s : list (Z * N)),
-       P x s.
+  Ltac Z_compare_cases := let H := fresh "H" in Z_named_compare_cases H.
+  
+  Lemma interval_compare_elim : forall (y1 : Z) (c1 : N) (y2 : Z) (c2 : N), 
+    match (interval_compare (y1, c1) (y2, c2)) with
+      | ICR_before         => (y1 + Z.of_N c1) < y2
+      | ICR_before_touch   => (y1 + Z.of_N c1) = y2
+      | ICR_after          => (y2 + Z.of_N c2) < y1
+      | ICR_after_touch    => (y2 + Z.of_N c2) = y1
+      | ICR_equal          => (y1 = y2) /\ (c1 = c2)
+      | ICR_overlap_before => (y1 < y2) /\ (y2 < y1 + Z.of_N c1) /\ (y1 + Z.of_N c1 < y2 + Z.of_N c2)
+      | ICR_overlap_after  => (y2 < y1) /\ (y1 < y2 + Z.of_N c2) /\ (y2 + Z.of_N c2 < y1 + Z.of_N c1)
+      | ICR_subsume_1      => (y2 <= y1) /\ (y1 + Z.of_N c1 <= y2 + Z.of_N c2) /\ (y2 < y1 \/ y1 + Z.of_N c1 < y2 + Z.of_N c2)
+      | ICR_subsume_2      => (y1 <= y2) /\ (y2 + Z.of_N c2 <= y1 + Z.of_N c1) /\ (y1 < y2 \/ y2 + Z.of_N c2 < y1 + Z.of_N c1)
+    end.
   Proof.
-    intros P H1 H2 H3 H4 H5 H6 H7 H8.
-    move => x s.
-    remember (length s) as n.
-    revert s Heqn. 
-    induction n as [n IH] using Wf_nat.lt_wf_ind. 
-    case. {
-      move => _. apply H1.
-    } {
-      move => [y c] s' H_n.
-      simpl in H_n.
-      have IH_s': (P x s'). {
-        apply (IH (length s')) => //.
-        rewrite H_n //.
-      }
-      case_eq (x + 1 ?= y). {
-        move => /Z.compare_eq_iff <-.
-        apply H2.
-      } {
-        move => H_x1y_comp.
-        by apply H3.
-      } {
-        move => H_x1y_comp.
-        case_eq (x ?= y + Z.of_N c). {            
-          move => H_x_eqb.
-          move : (H_x_eqb) => /Z.compare_eq_iff H_x_eq.
-          case_eq s'. {
-            move => _.
-            rewrite H_x_eq.
-            apply H4.
-            rewrite -H_x1y_comp H_x_eq //.
-          } {
-            move => [z c'] l H_s'.
-            have IH_l: (P x l). {
-              apply (IH (length l)) => //.
-              rewrite H_n H_s' /=.
-              apply Lt.lt_trans with (m := S (length l)) => //.
-            }
-            case_eq (z =? x + 1). { 
-              move => /Z.eqb_eq ->.
-              rewrite H_x_eq.
-              apply H5. {
-                rewrite -H_x1y_comp H_x_eq //.
-              } {
-                rewrite -H_x_eq.
-                apply IH_l.
-              }
-            } {
-              move => H_z_neq.
-              rewrite H_x_eq.
-              eapply H6 => //; rewrite -H_x_eq //.
-            }
-          }
-        } {
-          by apply H7.
-        } {
-          move => H_x_gt.
-          apply H8 => //.
+    intros y1 c1 y2 c2.
+    rewrite /interval_compare.
+    (repeat Z_compare_cases); subst; repeat split;
+       try (by apply Z.eq_le_incl); 
+       try (by apply Z.lt_le_incl);
+       try (by left); try (by right).
+
+    apply Z.add_reg_l in H2.
+    by apply N2Z.inj.
+  Qed.
+
+  Lemma interval_compare_swap : forall (y1 : Z) (c1 : N) (y2 : Z) (c2 : N),
+    (c1 <> 0%N) \/ (c2 <> 0%N) -> 
+    interval_compare (y2, c2) (y1, c1) =
+    match (interval_compare (y1, c1) (y2, c2)) with
+      | ICR_before         => ICR_after
+      | ICR_before_touch   => ICR_after_touch
+      | ICR_after          => ICR_before
+      | ICR_after_touch    => ICR_before_touch
+      | ICR_equal          => ICR_equal
+      | ICR_overlap_before => ICR_overlap_after
+      | ICR_overlap_after  => ICR_overlap_before
+      | ICR_subsume_1      => ICR_subsume_2
+      | ICR_subsume_2      => ICR_subsume_1
+    end.
+  Proof.
+    intros y1 c1 y2 c2 H_c12_neq_0.
+    rewrite /interval_compare.
+    move : (Z.compare_antisym y1 y2) => ->.
+    move : (Z.compare_antisym (y1 + Z.of_N c1) (y2 + Z.of_N c2)) => ->.
+    have H_suff : y1 + Z.of_N c1 <= y2 -> y2 + Z.of_N c2 <= y1 -> False. {
+      move => H1 H2.
+      case H_c12_neq_0 => H_c_neq_0. {
+        suff : (y1 + Z.of_N c1 <= y1). {
+          apply Z.nle_gt.
+          by apply Z_lt_add_r.
         }
+        eapply Z.le_trans; eauto.
+        eapply Z.le_trans; eauto.
+        apply Z_le_add_r.
+      } {
+        suff : (y2 + Z.of_N c2 <= y2). {
+          apply Z.nle_gt.
+          by apply Z_lt_add_r.
+        }
+        eapply Z.le_trans; eauto.
+        eapply Z.le_trans; eauto.
+        apply Z_le_add_r.
       }
+    }
+    repeat Z_compare_cases. {
+      exfalso; apply H_suff.
+        - by rewrite H; apply Z.le_refl.
+        - by rewrite H0; apply Z.le_refl.
+    } {
+      exfalso; apply H_suff.
+        - by rewrite H; apply Z.le_refl.
+        - by apply Z.lt_le_incl.
+    } {
+      exfalso; apply H_suff.
+        - by apply Z.lt_le_incl.
+        - by rewrite H0; apply Z.le_refl.
+    } {
+      exfalso; apply H_suff.
+        - by apply Z.lt_le_incl.
+        - by apply Z.lt_le_incl.
+    }
+  Qed.
+  
+  Lemma interval_1_compare_alt_def : forall (y : Z) (i : (Z * N)), 
+    interval_1_compare y i = match (interval_compare (y, (1%N)) i) with
+      | ICR_equal => ICR_subsume_1
+      | ICR_subsume_1 => ICR_subsume_1
+      | ICR_subsume_2 => ICR_subsume_1
+      | r => r
+    end.
+  Proof.
+    move => y1 [y2 c2].
+    rewrite /interval_1_compare /interval_compare.
+    replace (y1 + Z.of_N 1) with (Z.succ y1); last done.
+    repeat Z_compare_cases. {
+      contradict H1.
+      by apply Zle_not_lt, Zlt_succ_le.
+    } {
+      contradict H.
+      by apply Zle_not_lt, Zlt_succ_le.
     }
   Qed.
 
+  Lemma interval_1_compare_elim : forall (y1 : Z) (y2 : Z) (c2 : N), 
+    match (interval_1_compare y1 (y2, c2)) with
+      | ICR_before         => Z.succ y1 < y2
+      | ICR_before_touch   => y2 = Z.succ y1 
+      | ICR_after          => (y2 + Z.of_N c2) < y1
+      | ICR_after_touch    => (y2 + Z.of_N c2) = y1
+      | ICR_equal          => False
+      | ICR_overlap_before => False
+      | ICR_overlap_after  => False
+      | ICR_subsume_1      => (c2 = 0%N) \/ ((y2 <= y1) /\ (y1 < y2 + Z.of_N c2))
+      | ICR_subsume_2      => False
+    end.
+  Proof.
+    intros y1 y2 c2.
+    move : (interval_compare_elim y1 (1%N) y2 c2).
+    rewrite interval_1_compare_alt_def.
+    have H_succ: forall z, z + Z.of_N 1 = Z.succ z by done.
+
+    case_eq (interval_compare (y1, 1%N) (y2, c2)) => H_comp;
+      rewrite ?H_succ ?Z.lt_succ_r ?Z.le_succ_l //. {
+      move => [H_lt] [H_le] _.
+      contradict H_lt.
+      by apply Zle_not_lt.
+    } {
+      move => [_] [H_lt] H_le.
+      contradict H_lt.
+      by apply Zle_not_lt.
+    } {
+      move => [->] <-.
+      rewrite ?Z.lt_succ_r.
+      right.
+      split; apply Z.le_refl.
+    } {
+      tauto.
+    } {
+      case (N.zero_or_succ c2). { 
+        move => -> _; by left.
+      } {
+        move => [c2'] ->.
+        rewrite !N2Z.inj_succ Z.add_succ_r -Z.succ_le_mono Z.le_succ_l.
+        move => [H_y1_le] [H_le_y1].        
+        suff -> : y1 = y2. {
+          move => [] H_pre; contradict H_pre. {
+            apply Z.lt_irrefl.
+          } {
+            apply Zle_not_lt, Z_le_add_r.
+          }
+        }
+        apply Z.le_antisymm => //.
+        eapply Z.le_trans; last apply H_le_y1.
+        apply Z_le_add_r.
+      }
+    }
+  Qed.
+      
+   (** *** Alternative definition of addZ *)
   Lemma addZ_aux_alt_def : forall x s acc,
     addZ_aux acc x s = (List.rev acc) ++ addZ x s. 
-  Proof.
-    move => ? ?.
-    eapply addZ_ind with (P := (fun x s => forall acc, addZ_aux acc x s = rev acc ++ addZ x s)); clear. {
-      intros x acc.
-      rewrite /addZ_aux /rev' -rev_alt //.
+  Proof. 
+    intros y1 s.
+    unfold addZ.
+    induction s as [| [y2 c2] s' IH] => acc. {
+      rewrite /addZ_aux /addZ /= /rev' !rev_append_rev /= app_nil_r //.
     } {
-      intros x l c acc.
-      rewrite /addZ /= Z.compare_refl rev_append_rev //.
-    } {
-      intros x l y c H_y_lt acc.
-      rewrite /addZ /= H_y_lt rev_append_rev //.
-    } {
-      intros y c H_y_comp acc.
-      rewrite /addZ /= H_y_comp Z.compare_refl /rev' -rev_alt //.
-    } {
-      intros l y c c' H_y_comp IH acc.
-      rewrite /addZ /= H_y_comp Z.compare_refl Z.eqb_refl.
-      rewrite rev_append_rev //.
-    } {
-      intros l y c z c' H_y_comp H_z_comp acc.
-      rewrite /addZ /= H_y_comp Z.compare_refl H_z_comp.
-      rewrite rev_append_rev /= //.
-    } {
-      intros x l y c H_y_comp H_x_comp acc.
-      rewrite /addZ /= H_x_comp H_y_comp rev_append_rev //.
-    } {
-      intros x l y c H_y_comp H_x_comp IH acc.      
-      rewrite /addZ /= H_x_comp H_y_comp.
-      rewrite !IH /= -app_assoc //.
+      unfold addZ_aux.
+      case (interval_1_compare y1 (y2, c2)); fold addZ_aux;
+        rewrite ?rev_append_rev /= ?app_assoc_reverse //.
+      rewrite (IH ((y2,c2)::acc)) (IH ((y2,c2)::nil)).
+      rewrite /= app_assoc_reverse //.
     }
   Qed.
        
   Lemma addZ_alt_def : forall x s, 
     addZ x s =
     match s with
-    | nil => (x, 1%N)::nil
+    | nil => (x, (1%N))::nil
     | (y, c) :: l =>
-        match (Z.compare (x+1) y) with
-        | Lt => (x, 1%N)::s
-        | Eq => (x, (c+1)%N)::l
-        | Gt => match (Z.compare x (y+Z.of_N c)) with
-                 | Lt => s
-                 | Gt => (y,c) :: addZ x l
-                 | Eq => match l with
-                           | nil => (y, (c+1)%N)::nil 
-                           | (z, c') :: l' => if (Z.eqb z (x + 1)) then
-                                (y, (c + c' + 1)%N) :: l'
-                             else
-                                (y,(c+1)%N) :: (z, c') :: l'
-                         end
-                end                 
-        end  
+        match (interval_1_compare x (y,c)) with
+          | ICR_before       => (x, (1%N))::s
+          | ICR_before_touch => (x, N.succ c)::l
+          | ICR_after        => (y,c)::(addZ x l)
+          | ICR_after_touch  => insert_interval_begin y (N.succ c) l
+          | _  => (y, c)::l
+        end
     end.
   Proof.
     intros x s.
-    rewrite /addZ Z.add_1_r. 
+    rewrite /addZ.
     case s => //.
-    move => [y c] s' /=.
-    case (Z.succ x ?= y). {
-      rewrite N.add_1_r //.
-    } { 
-      reflexivity.
-    } { 
-      case (x ?= y+ Z.of_N c) => //. {
-        rewrite !N.add_1_r.
-        case s' => //.
-        move => [z c'] s'' //.
-        rewrite !N.add_1_r //.
-      } {
-        rewrite addZ_aux_alt_def //.
-      }
-    }
+    move => [y c] s'.
+    unfold addZ_aux.
+    case (interval_1_compare x (y, c)); fold addZ_aux;
+      rewrite ?rev_append_rev /= ?app_assoc_reverse //.
+    rewrite addZ_aux_alt_def //.
   Qed.
    
 
-  (** *** Alternative definition of removeZ *)
-
-  (** [removeZ] is defined with efficient execution in mind.
-      We derive first an alternative definition that demonstrates
-      the intention better and is better suited for proofs. *)
-
-  Lemma removeZ_aux_alt_def : forall s x acc,
-    removeZ_aux acc x s = (List.rev acc) ++ removeZ x s. 
-  Proof.
-    induction s as [| [y c] s' IH]. {
-      intros x acc.
-      rewrite /removeZ /removeZ_aux /= app_nil_r /rev' -rev_alt //.
-    } {
-      intros x acc.
-      rewrite /removeZ /removeZ_aux -/removeZ_aux.
-      case (x <? y). {
-        rewrite !rev_append_rev //=.
-      } {
-        case (x <? y + Z.of_N c). {
-          rewrite /removeZ_aux_insert_guarded.
-          case (Z.to_N (y + Z.of_N c - (Z.succ x)) =? 0)%N, (Z.to_N (x - y) =? 0)%N;
-            rewrite !rev_append_rev /= // -!app_assoc /= //.
-        } {
-          rewrite !IH /= -app_assoc /= //.
-        }
-      }
-    }
-  Qed.
-
-  Lemma removeZ_alt_def : forall x s,
-    removeZ x s =
-    match s with
-    | nil => nil
-    | (y, c) :: l =>
-        if (Z.ltb x y) then s else
-        if (Z.ltb x (y+Z.of_N c)) then (
-           (removeZ_aux_insert_guarded y (Z.to_N (x-y)) 
-             (removeZ_aux_insert_guarded (Z.succ x) (Z.to_N ((y+Z.of_N c)- (Z.succ x))) l))
-        ) else (y, c) :: removeZ x l
-    end.
-  Proof.
-    intros x s.
-    rewrite /removeZ /=.
-    case s => //.
-    move => [y c] s' /=.
-    case(x <? y) => //.
-    case(x <? y + Z.of_N c). {
-      rewrite /removeZ_aux_insert_guarded.
-      case (Z.to_N (y + Z.of_N c - (Z.succ x)) =? 0)%N, (Z.to_N (x - y) =? 0)%N => //. 
-    } {
-      rewrite removeZ_aux_alt_def //.
-    }
-  Qed.
-            
-
+    
   (** *** Auxiliary Lemmata about Invariant *)
 
-  Lemma inf_impl : forall x y s,
-    (y <= x) -> inf x s = true -> inf y s = true.
+  Lemma interval_list_elements_greater_cons : forall z x c s,
+    interval_list_elements_greater z ((x, c) :: s) = true <-> 
+    (z < x).  
+  Proof.
+    intros z x c s.
+    rewrite /=.
+    apply Z.ltb_lt.
+  Qed.
+
+  Lemma interval_list_elements_greater_impl : forall x y s,
+    (y <= x) -> 
+    interval_list_elements_greater x s = true -> 
+    interval_list_elements_greater y s = true.
   Proof.
     intros x y s.
     case s => //.
     move => [z c] s'.
-    rewrite /inf.
+    rewrite /interval_list_elements_greater.
     move => H_y_leq /Z.ltb_lt H_x_lt.
     apply Z.ltb_lt.
     eapply Z.le_lt_trans; eauto.
   Qed.
 
+  Lemma interval_list_invariant_nil : interval_list_invariant nil = true.
+  Proof.
+    by [].
+  Qed.
+ 
   Lemma Ok_nil : Ok nil <-> True. 
   Proof.
-    rewrite /Ok /IsOk /isok /is_encoded_elems_list //.
+    rewrite /Ok /IsOk /interval_list_invariant /is_encoded_elems_list //.
   Qed.
 
   Lemma is_encoded_elems_list_app : forall l1 l2,
@@ -934,10 +1168,12 @@ Module Raw (Enc : ElementEncode).
     ).
   Qed.
 
-  Lemma isok_cons : forall y c s', isok ((y, c) :: s') = true <-> 
-    (inf (y+Z.of_N c) s' = true /\ ((c <> 0)%N) /\ isok s' = true). 
+  Lemma interval_list_invariant_cons : forall y c s', 
+    interval_list_invariant ((y, c) :: s') = true <-> 
+    (interval_list_elements_greater (y+Z.of_N c) s' = true /\ 
+      ((c <> 0)%N) /\ interval_list_invariant s' = true). 
   Proof.
-    rewrite /isok -/isok.
+    rewrite /interval_list_invariant -/interval_list_invariant.
     intros y c s'.
     rewrite !Bool.andb_true_iff negb_true_iff.
     split. {
@@ -947,69 +1183,226 @@ Module Raw (Enc : ElementEncode).
     }
   Qed.
 
+  Lemma interval_list_invariant_sing : forall x c,
+    interval_list_invariant ((x, c)::nil) = true <-> (c <> 0)%N.
+  Proof.
+    intros x c.
+    rewrite interval_list_invariant_cons.
+    split; tauto.
+  Qed.
+
   Lemma Ok_cons : forall y c s', Ok ((y, c) :: s') <-> 
-    (inf (y+Z.of_N c) s' = true /\ ((c <> 0)%N) /\ 
+    (interval_list_elements_greater (y+Z.of_N c) s' = true /\ ((c <> 0)%N) /\ 
      is_encoded_elems_list (elementsZ_single y c) /\ Ok s'). 
   Proof.
     intros y c s'.
-    rewrite /Ok /IsOk isok_cons elementsZ_cons is_encoded_elems_list_app
+    rewrite /Ok /IsOk interval_list_invariant_cons elementsZ_cons is_encoded_elems_list_app
        is_encoded_elems_list_rev.
     tauto.
   Qed.
 
   Lemma Nin_elements_greater : forall s y,
-     inf y s = true ->
-     isok s = true ->
-     forall x, x <= y ->
-     ~(InZ x s).
+     interval_list_elements_greater y s = true ->
+     interval_list_invariant s = true ->
+     forall x, x <= y -> ~(InZ x s).
   Proof.
     induction s as [| [z c] s' IH]. {
       intros y _ _ x _.
-      done.
+      by simpl.
     } {
-      rewrite /inf.
-      move => y /Z.ltb_lt H_y_lt /isok_cons [H_inf'] [H_c] H_s' x H_x_le.
-      rewrite /InZ elementsZ_cons in_app_iff -!in_rev In_elementsZ_single. 
-      move => []. {
-        eapply IH; eauto.
-        apply Z.le_trans with (m := z). {
-          eapply Z.lt_le_incl.
-          eapply Z.le_lt_trans; eauto.
-        } {
-          apply Z_le_add_r.
-        }
-      } {
+      move => y /interval_list_elements_greater_cons H_y_lt
+        /interval_list_invariant_cons [H_gr] [H_c] H_s'
+        x H_x_le.
+      rewrite InZ_cons In_elementsZ_single. 
+      have H_x_lt : x < z by eapply Z.le_lt_trans; eauto.
+
+      move => []. {              
         move => [H_z_leq] _; contradict H_z_leq.
-        apply Z.nle_gt.
-        eapply Z.le_lt_trans; eauto.
+        by apply Z.nle_gt.
+      } {
+        eapply IH; eauto.
+        by apply Z_lt_le_add_r.
       }
     }
   Qed.
 
-  Lemma isok_inf_nin :
+  Lemma Nin_elements_greater_equal :
      forall x s,
-       isok s = true ->
-       inf x s = true ->
+       interval_list_elements_greater x s = true ->
+       interval_list_invariant s = true ->
        ~ (InZ x s). 
   Proof.
-    move => x.
-    induction s as [| [y c] s' IH]. {
-      move => _ _.
-      rewrite /InZ elementsZ_nil //.
-    } {
-      rewrite isok_cons.
-      move => [H_inf] [_] H_ok_s' /Z.ltb_lt H_x_lt_y.
-      rewrite /InZ elementsZ_cons in_app_iff -in_rev In_elementsZ_single Z.le_ngt.
-      suff : inf x s' = true by tauto.
-      eapply inf_impl; last apply H_inf.
-      apply Z.le_trans with (m := y). {
-        by apply Z.lt_le_incl.
-      } {
-        by apply Z_le_add_r.
-      }
-    } 
+    move => x s H_inv H_gr. 
+    apply (Nin_elements_greater s x) => //.
+    apply Z.le_refl.
   Qed.
 
+  Lemma interval_list_elements_greater_alt_def : forall s y,
+     interval_list_invariant s = true ->
+
+     (interval_list_elements_greater y s = true <->
+      (forall x, x <= y -> ~(InZ x s))).
+  Proof.
+    intros s y H_inv.
+    split. {
+      move => H_gr.
+      apply Nin_elements_greater => //.
+    } {
+      move : H_inv.
+      case s as [| [x2 c] s'] => //.
+      rewrite interval_list_invariant_cons interval_list_elements_greater_cons.
+      move => [_] [H_c_neq] _ H.
+      apply Z.nle_gt => H_ge.
+      apply (H x2) => //.
+      rewrite InZ_cons; left.
+      apply In_elementsZ_single_hd => //.
+    }
+  Qed.
+
+  Lemma interval_list_elements_greater_alt2_def : forall s y,
+     interval_list_invariant s = true ->
+
+     (interval_list_elements_greater y s = true <->
+      (forall x, InZ x s -> y < x)).
+  Proof.
+    intros s y H.
+    rewrite interval_list_elements_greater_alt_def //.
+    firstorder.
+    apply Z.nle_gt.
+    move => H_lt.
+    eapply H0; eauto.
+  Qed.
+
+  Lemma interval_list_elements_greater_intro : forall s y,
+     interval_list_invariant s = true ->
+     (forall x, InZ x s -> y < x) ->
+     interval_list_elements_greater y s = true.
+  Proof.
+    intros s y H1 H2.
+    rewrite interval_list_elements_greater_alt2_def //.
+  Qed.
+               
+  Lemma interval_list_elements_greater_app_elim_1 : forall s1 s2 y,
+    interval_list_elements_greater y (s1 ++ s2) = true ->
+    interval_list_elements_greater y s1 = true.
+  Proof.
+    intros s1 s2 y.
+    case s1 => //.
+  Qed.
+
+  Lemma interval_list_invariant_app_intro : forall s1 s2,
+      interval_list_invariant s1 = true ->
+      interval_list_invariant s2 = true ->
+      (forall (x1 x2 : Z), InZ x1 s1 -> InZ x2 s2 -> Z.succ x1 < x2) ->
+      interval_list_invariant (s1 ++ s2) = true.
+  Proof.
+    induction s1 as [| [y1 c1] s1' IH]. {
+      move => s2 _ //.
+    } {
+      move => s2.
+      rewrite -app_comm_cons !interval_list_invariant_cons.
+      move => [H_gr] [H_c1_neq] H_inv_s1' H_inv_s2 H_inz_s2.
+      split; last split. {
+        move : H_gr H_inz_s2.
+        case s1' as [| [y1' c1'] s1'']; last done.
+        move => _ H_inz_s2.
+        rewrite app_nil_l.
+        apply interval_list_elements_greater_intro => //.
+        move => x H_x_in_s2.
+        suff H_inz : InZ (Z.pred (y1 + Z.of_N c1)) ((y1, c1) :: nil). {
+          move : (H_inz_s2 _ _ H_inz H_x_in_s2).
+          by rewrite Z.succ_pred.
+        }
+        rewrite InZ_cons In_elementsZ_single -Z.lt_le_pred; left.
+        split. {
+          by apply Z_lt_add_r.
+        } {
+          apply Z.lt_pred_l.
+        }
+      } {
+        assumption.
+      } {
+        apply IH => //.
+        intros x1 x2 H_in_x1 H_in_x2.
+        apply H_inz_s2 => //.
+        rewrite InZ_cons; by right.
+      }
+    }
+  Qed.
+
+
+  Lemma interval_list_invariant_app_elim : forall s1 s2,
+      interval_list_invariant (s1 ++ s2) = true ->
+      interval_list_invariant s1 = true /\
+      interval_list_invariant s2 = true /\
+      (forall (x1 x2 : Z), InZ x1 s1 -> InZ x2 s2 -> Z.succ x1 < x2).
+  Proof.
+    move => s1 s2.
+    induction s1 as [| [y1 c1] s1' IH]; first done.
+    rewrite -app_comm_cons !interval_list_invariant_cons.
+
+    move => [H_gr] [H_c1_neq_0] /IH [H_inv_s1'] [H_inv_s2] H_in_s1'_s2.
+    repeat split; try assumption. {
+      move : H_gr.
+      case s1'; first done.
+      move => [y2 c2] s1''.
+      rewrite interval_list_elements_greater_cons //.
+    } {
+      move => x1 x2.
+      rewrite InZ_cons In_elementsZ_single.
+      move => []; last by apply H_in_s1'_s2.
+      move => [] H_y1_le H_x1_lt H_x2_in.
+      move : H_gr.
+      rewrite interval_list_elements_greater_alt2_def; last first. {
+          by apply interval_list_invariant_app_intro.
+      }
+      move => H_in_s12'.
+      have : (y1 + Z.of_N c1 < x2). {
+        apply H_in_s12'.
+        rewrite InZ_app.
+        by right.
+      }
+      move => H_lt_x2.
+      apply Z.le_lt_trans with (m := y1 + Z.of_N c1) => //.
+      by apply Zlt_le_succ.
+    }
+  Qed.
+
+  Lemma interval_list_invariant_app_iff : forall s1 s2,
+      interval_list_invariant (s1 ++ s2) = true <->
+      (interval_list_invariant s1 = true /\
+      interval_list_invariant s2 = true /\
+      (forall (x1 x2 : Z), InZ x1 s1 -> InZ x2 s2 -> Z.succ x1 < x2)).
+  Proof.
+    intros s1 s2.
+    split. {
+      by apply interval_list_invariant_app_elim.
+    } {
+      move => [] H_inv_s1 [].
+      by apply interval_list_invariant_app_intro.
+    }
+  Qed.
+
+  Lemma interval_list_invariant_snoc_intro : forall s1 y2 c2,
+      interval_list_invariant s1 = true ->
+      (c2 <> 0)%N ->
+      (forall x, InZ x s1 -> Z.succ x < y2) ->
+      interval_list_invariant (s1 ++ ((y2, c2)::nil)) = true.
+  Proof.
+    intros s1 y2 c2 H_inv_s1 H_c2_neq H_in_s1.
+    apply interval_list_invariant_app_intro => //. {
+      rewrite interval_list_invariant_cons; done.
+    } {
+      intros x1 x2 H_in_x1.
+      rewrite InZ_cons.
+      move => [] //.
+      rewrite In_elementsZ_single.
+      move => [H_y2_le] _.
+      eapply Z.lt_le_trans; eauto.
+    }
+  Qed.
+
+    
   (** *** Properties of In and InZ *)
 
   Lemma In_alt_def : forall x s, Ok s -> 
@@ -1065,30 +1458,43 @@ Module Raw (Enc : ElementEncode).
     apply H_ok.
   Qed.
 
+  Lemma InZ_In : forall x s, Ok s -> 
+    (InZ x s -> In (Enc.decode x) s).
+  Proof.
+    intros x s H_ok.
+    rewrite In_InZ /InZ.
+    move : H_ok.
+    rewrite /Ok /IsOk /is_encoded_elems_list.
+    move => [_] H_enc.
+    move => H_in.
+    move : (H_enc _ H_in) => [e] H_x.
+    subst.
+    by rewrite Enc.decode_encode_ok.
+  Qed.
+
 
   (** *** Membership specification *)
           
   Lemma memZ_spec :
-   forall (s : t) (x : Z) (Hs : Ok s), memZ x s = true <-> InZ x s.
+    forall (s : t) (x : Z) (Hs : Ok s), memZ x s = true <-> InZ x s.
   Proof.
     induction s as [| [y c] s' IH]. {
       intros x _.
       rewrite /InZ elementsZ_nil //.
     } {    
       move => x /Ok_cons [H_inf] [H_c] [H_is_enc] H_s'.  
-      rewrite /InZ /memZ elementsZ_cons -/mem.
-      rewrite /isok -/isok in_app_iff -!in_rev In_elementsZ_single.
+      rewrite /InZ /memZ elementsZ_cons -/memZ.
+      rewrite in_app_iff -!in_rev In_elementsZ_single.
 
       case_eq (x <? y). {
         move => /Z.ltb_lt H_x_lt.
         split; first done.
         move => []. {
           move => H_x_in; contradict H_x_in.
-          eapply Nin_elements_greater; eauto; first apply H_s'.
-          apply Z.le_trans with (m := y). {
-            by apply Z.lt_le_incl.
+          apply Nin_elements_greater with (y := (y + Z.of_N c)) => //. {
+            apply H_s'.
           } {
-            apply Z_le_add_r.
+            apply Z_lt_le_add_r => //.
           }
         } {
           move => [H_y_le]; contradict H_y_le.
@@ -1120,201 +1526,345 @@ Module Raw (Enc : ElementEncode).
     rewrite /mem memZ_spec In_InZ //.
   Qed.
 
+  Lemma merge_interval_size_neq_0 : forall x1 c1 x2 c2,
+     (c1 <> 0%N) ->
+     (merge_interval_size x1 c1 x2 c2 <> 0)%N.
+  Proof.
+    intros x1 c1 x2 c2.
+    rewrite /merge_interval_size !N.neq_0_lt_0 N.max_lt_iff.
+    by left.
+  Qed.
+
+
+  (** *** insert if length not 0 *)
+
+  Lemma interval_list_invariant_insert_intervalZ_guarded : forall x c s,
+    interval_list_invariant s = true -> 
+    interval_list_elements_greater (x + Z.of_N c) s = true ->
+    interval_list_invariant (insert_intervalZ_guarded x c s) = true.
+  Proof.
+    intros x c s.
+    rewrite /insert_intervalZ_guarded.
+    case_eq (c =? 0)%N => //.
+    move => /N.eqb_neq.
+    rewrite interval_list_invariant_cons.
+    tauto.
+  Qed.
+
+  Lemma interval_list_elements_greater_insert_intervalZ_guarded : forall x c y s,
+    interval_list_elements_greater y (insert_intervalZ_guarded x c s) = true <->
+    (if (c =? 0)%N then (interval_list_elements_greater y s = true) else (y < x)).
+  Proof.
+    intros x c y s.
+    rewrite /insert_intervalZ_guarded.
+    case (c =? 0)%N => //.       
+    rewrite /interval_list_elements_greater Z.ltb_lt //.
+  Qed.
+
+  Lemma insert_intervalZ_guarded_app : forall x c s1 s2,
+    (insert_intervalZ_guarded x c s1) ++ s2 =
+    insert_intervalZ_guarded x c (s1 ++ s2).
+  Proof.
+    intros x c s1 s2.
+    rewrite /insert_intervalZ_guarded.
+    case (N.eqb c 0) => //.
+  Qed.
+
+  Lemma insert_intervalZ_guarded_rev_nil_app : forall x c s,
+    rev (insert_intervalZ_guarded x c nil) ++ s =
+    insert_intervalZ_guarded x c s.
+  Proof.
+    intros x c s.
+    rewrite /insert_intervalZ_guarded.
+    case (N.eqb c 0) => //.
+  Qed.
+
+Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
+    elementsZ (insert_intervalZ_guarded x c s) = elementsZ ((x, c) :: s). 
+  Proof.
+    intros x c s.
+    rewrite /insert_intervalZ_guarded.
+    case_eq (c =? 0)%N => //.
+    move => /N.eqb_eq ->.
+    rewrite elementsZ_cons elementsZ_single_base /= app_nil_r //.
+  Qed.
+
+  Lemma InZ_insert_intervalZ_guarded : forall y x c s,
+    InZ y (insert_intervalZ_guarded x c s) = InZ y ((x, c) :: s). 
+  Proof.
+    intros y x c s.
+    rewrite /InZ elementsZ_insert_intervalZ_guarded //.
+  Qed.
+  
+  (** *** Merging intervals *)
+
+  Lemma merge_interval_size_add : forall x c1 c2,
+     (merge_interval_size x c1 (x + Z.of_N c1) c2 = (c1 + c2))%N.
+  Proof.
+    intros x c1 c2.
+    rewrite /merge_interval_size.
+    replace (x + Z.of_N c1 + Z.of_N c2 - x) with
+            (Z.of_N c1 + Z.of_N c2) by omega.
+    rewrite -N2Z.inj_add N2Z.id.
+    apply N.max_r, N.le_add_r.
+  Qed.
+
+  Lemma merge_interval_size_eq_max : forall y1 c1 y2 c2,
+     y1 <= y2 + Z.of_N c2 ->
+     y1 + Z.of_N (merge_interval_size y1 c1 y2 c2) = 
+     Z.max (y1 + Z.of_N c1) (y2 + Z.of_N c2).
+  Proof.
+    intros y1 c1 y2 c2 H_y1_le.
+    rewrite /merge_interval_size N2Z.inj_max Z2N.id; last first. {
+      by apply Zle_minus_le_0.
+    }
+    rewrite -Z.add_max_distr_l.
+    replace (y1 + (y2 + Z.of_N c2 - y1)) with (y2 + Z.of_N c2) by omega.
+    done.
+  Qed.
+
+  Lemma merge_interval_size_invariant : forall y1 c1 y2 c2 z s,
+    interval_list_invariant s = true ->
+    y1 + Z.of_N c1 <= y2 + Z.of_N c2 ->
+    y2 + Z.of_N c2 <= z ->
+    interval_list_elements_greater z s = true ->
+    (c1 <> 0)%N ->
+    interval_list_invariant ((y1, merge_interval_size y1 c1 y2 c2) :: s) =
+   true.
+  Proof.
+    intros y1 c1 y2 c2 z s H_inv H_le H_le_z H_gr H_c1_neq_0.
+    rewrite interval_list_invariant_cons.
+    split; last split. {
+      rewrite merge_interval_size_eq_max; last first. {
+        eapply Z.le_trans; last apply H_le.
+        apply Z_le_add_r.
+      } {
+        rewrite Z.max_r => //.
+        eapply interval_list_elements_greater_impl; first apply H_le_z.
+        done.
+      }
+    } {
+      apply merge_interval_size_neq_0.
+      assumption.
+    } {
+      assumption.
+    }
+  Qed.
+
+
+  Lemma In_merge_interval : forall x1 c1 x2 c2 y,
+    x1 <= x2 -> 
+    x2 <= x1 + Z.of_N c1 -> (
+    List.In y (elementsZ_single x1 (merge_interval_size x1 c1 x2 c2)) <->
+    List.In y (elementsZ_single x1 c1) \/ List.In y (elementsZ_single x2 c2)).
+  Proof.
+    intros x1 c1 x2 c2 y H_x1_le H_x2_le.
+    rewrite !In_elementsZ_single merge_interval_size_eq_max; 
+      last first. {
+      eapply Z.le_trans; eauto.
+      by apply Z_le_add_r.
+    }
+    rewrite Z.max_lt_iff.
+    split. {
+      move => [H_x_le] [] H_y_lt. {
+        by left.
+      } {
+        case_eq (Z.leb x2 y). {
+          move => /Z.leb_le H_y'_le.
+          by right.
+        } {
+          move => /Z.leb_gt H_y_lt_x2.
+          left.
+          split => //.
+          eapply Z.lt_le_trans; eauto.
+        }
+      }
+    } {
+      move => []. {
+        tauto.
+      } {
+        move => [H_x2_le'] H_y_lt.
+        split. {
+          eapply Z.le_trans; eauto.
+        } {
+          by right.
+        }
+      }
+    }
+  Qed.
+
+  Lemma insert_interval_begin_spec : forall y s x c,
+     interval_list_invariant s = true -> 
+     interval_list_elements_greater x s = true ->
+     (c <> 0)%N ->
+      (
+     interval_list_invariant (insert_interval_begin x c s) = true /\
+     (InZ y (insert_interval_begin x c s) <->
+     (List.In y (elementsZ_single x c) \/ InZ y s))).
+  Proof.
+    intros y.
+    induction s as [| [y' c'] s' IH]. {
+      intros x c _ H_c_neq H_z_lt.
+      rewrite /insert_interval_begin InZ_cons interval_list_invariant_cons //.
+    } {
+      intros x c.
+      rewrite interval_list_invariant_cons
+       interval_list_elements_greater_cons.
+      move => [H_gr] [H_c'_neq_0] H_inv_s' H_x_lt H_c_neq_0.
+      unfold insert_interval_begin.
+      Z_named_compare_cases H_y'; fold insert_interval_begin. {
+        subst.
+        rewrite !InZ_cons elementsZ_single_add in_app_iff.
+        split; last tauto.
+        rewrite interval_list_invariant_cons N2Z.inj_add
+          Z.add_assoc N.eq_add_0.
+        tauto.
+      } {
+        rewrite !InZ_cons !interval_list_invariant_cons
+          interval_list_elements_greater_cons.
+        repeat split => //.
+      } {
+        set c'' := merge_interval_size x c y' c'.
+        have H_x_lt' : x < y' + Z.of_N c'. {
+          eapply Z.lt_le_trans with (m := y') => //. 
+          by apply Z_le_add_r.
+        } 
+
+        have H_pre : interval_list_elements_greater x s' = true. {
+          eapply interval_list_elements_greater_impl; eauto.
+          by apply Z.lt_le_incl.
+        }
+        have H_pre2 : c'' <> 0%N. {
+          by apply merge_interval_size_neq_0.
+        }
+        move : (IH x c'' H_inv_s' H_pre H_pre2) => {IH} {H_pre} {H_pre2} [->] ->.
+
+        split; first reflexivity.
+        unfold c''; clear c''.
+        rewrite In_merge_interval. {
+          rewrite InZ_cons. 
+          tauto.
+        } {
+          by apply Z.lt_le_incl.
+        } {
+          by apply Z.lt_le_incl.
+        }
+      }
+    }
+  Qed.
+
 
   (** *** add specification *)
-  Lemma addZ_spec :
-   forall (s : t) (x y : Z) (Hs : Ok s),
-    InZ y (addZ x s) <-> Z.eq y x \/ InZ y s.
+  Lemma addZ_InZ :
+   forall (s : t) (x y : Z),
+    interval_list_invariant s = true ->
+    (InZ y (addZ x s) <-> x = y \/ InZ y s).
   Proof.
-    intros s x y.
-    eapply addZ_ind with (P := (fun (x:Z) s => Ok s -> (InZ y (addZ x s) <-> Z.eq y x \/ InZ y s))); clear s x. {
-      move => x _.
-      rewrite /InZ addZ_alt_def elementsZ_cons elementsZ_nil app_nil_l -in_rev
+    move => s x y.
+    induction s as [| [z c] s' IH]. {
+      move => _.
+      rewrite /InZ addZ_alt_def
+              elementsZ_cons elementsZ_nil app_nil_l -in_rev
               In_elementsZ_single1 /=.
       firstorder.
     } {
-      intros x l c _.
-      rewrite /InZ addZ_alt_def Z.compare_refl !elementsZ_cons !in_app_iff -!in_rev N.add_1_r
-              Z.add_1_r !In_elementsZ_single N2Z.inj_succ Z.add_succ_l 
-              Z.add_succ_r Z.le_succ_l Z.lt_succ_r.   
-      split. {
-        move => []; first by tauto.
-        move => [] /Z.lt_eq_cases. 
-        firstorder.
+      move => /interval_list_invariant_cons [H_greater] [H_c_neq_0] H_inv_c'.
+      move : (IH H_inv_c') => {IH} IH.
+      rewrite addZ_alt_def.
+      have H_succ : forall z, z + Z.of_N 1 = Z.succ z by done.
+      move : (interval_1_compare_elim x z c).      
+      case (interval_1_compare x (z, c));
+        rewrite ?InZ_cons ?In_elementsZ_single1 ?H_succ ?Z.lt_succ_r //. {
+        move => ->.
+        rewrite elementsZ_single_succ_front /=.
+        tauto.
       } {
-        move => [-> | ]. {
-          right; split. 
-            - by apply Z.le_refl.
-            - by apply Z_le_add_r.
-        } {
-          move => []; first by tauto.
-          move => [H_x_lt H_y_le].
-          right; split => //.
-          by apply Z.lt_le_incl.
-        }
-      }  
-    } {
-      intros x l y0 c H_y_comp _.
-      rewrite /InZ addZ_alt_def H_y_comp elementsZ_cons in_app_iff
-          In_elementsZ_single1.
-      firstorder.
-    } {
-      move => y0 c H_y_comp H_ok.
-      rewrite addZ_alt_def H_y_comp Z.compare_refl.   
-      rewrite /InZ !elementsZ_cons elementsZ_nil !app_nil_l N.add_1_r.
-      rewrite elementsZ_single_succ -!in_rev in_app_iff /=.
-      firstorder.
-    } {
-      move => l y0 c c' H_y_comp _ _.
-      rewrite addZ_alt_def H_y_comp Z.compare_refl Z.eqb_refl.
-      rewrite /InZ !elementsZ_cons !in_app_iff -!in_rev.   
-      have -> : (c + c' + 1 = N.succ c + c')%N. {
-        rewrite -N.add_1_r. ring.
-      }
-      rewrite Z.add_1_r elementsZ_single_add elementsZ_single_succ !in_app_iff
-              N2Z.inj_succ Z.add_succ_r.
-      firstorder.
-    } {
-      intros l y0 c z c'.
-      move => H_y_comp H_z_comp _.
-      rewrite addZ_alt_def H_y_comp Z.compare_refl H_z_comp.
-      rewrite /InZ !elementsZ_cons N.add_1_r !in_app_iff -!in_rev.
-      rewrite elementsZ_single_succ in_app_iff /=.   
-      firstorder.
-    } {
-      intros x l y0 c H_y_comp H_x_comp _.
-      rewrite addZ_alt_def H_y_comp H_x_comp.   
-      split. {
-        by right.
+        move => [] // H_x_in.
+        split; first tauto.
+        move => [] // <-.
+        left.
+        by rewrite In_elementsZ_single.
       } {
-        move => [] // ->.
-        rewrite /InZ elementsZ_cons in_app_iff -in_rev In_elementsZ_single.
-        right. split. {
-          move : H_y_comp => /Z.compare_gt_iff.
-          rewrite Z.add_1_r Z.lt_succ_r //.
-        } {
-          move : H_x_comp => /Z.compare_lt_iff //.
+        rewrite IH.
+        tauto.
+      } {
+        move => H_x_eq.
+        have -> : (InZ y (insert_interval_begin z (N.succ c) s') <->
+                   List.In y (elementsZ_single z (N.succ c)) \/ InZ y s'). {
+          eapply insert_interval_begin_spec. {
+            by apply H_inv_c'.
+          } {
+            eapply interval_list_elements_greater_impl; eauto.
+            apply Z_le_add_r.
+          } {
+            by apply N.neq_succ_0.
+          }
         }
-      }
-    } {
-      intros x l y0 c H_y_comp H_x_comp IH H_ok.
-      have H_ok' : Ok l. {
-        move : H_ok. 
-        rewrite Ok_cons.
+        rewrite -H_x_eq elementsZ_single_succ in_app_iff /=.
         tauto.
       }
-      rewrite addZ_alt_def H_y_comp H_x_comp.   
-      unfold InZ in IH.
-      rewrite /InZ !elementsZ_cons !in_app_iff -!in_rev (IH H_ok').
-      firstorder.
     }
   Qed.
 
-  Lemma addZ_isok : forall s x, isok s = true -> isok (addZ x s) = true.
+  Lemma addZ_invariant : forall s x, 
+    interval_list_invariant s = true -> 
+    interval_list_invariant (addZ x s) = true.
   Proof. 
-    intros s x.
-    have H_add_1_neq : (forall x, x + 1 <> 0)%N. {
-      move => x'.
-      rewrite N.eq_add_0. 
-      have : (1 <> 0)%N by done.
-      tauto.
-    }
-    
-    eapply addZ_ind with (P := (fun (x : Z) (s : t) => isok s = true -> 
-          isok (addZ x s) = true)); clear s x. {
-      move => x _ //.
-    } {    
-      intros x l c.
-      rewrite addZ_alt_def Z.compare_refl.   
-      rewrite !isok_cons.
-      move => [H_inf] [H_c_neq] H_ok_l.
-      split; last split => //. {
-        suff -> : (x + Z.of_N (c + 1) = x + 1 + Z.of_N c) by done.
-        rewrite N2Z.inj_add /=.
-        ring.
-      }
+    move => s x.
+    induction s as [| [z c] s' IH]. {
+      move => _.
+      by simpl.
     } {
-      intros x l y c H_y_comp.
-      rewrite addZ_alt_def H_y_comp.   
-      rewrite !isok_cons => [[H_inf] [H_c_neq] H_ok_l].
-      split; last split; last split; last split; try done. 
-      by apply Z.ltb_lt.      
-    } {
-      move => y c H_y_comp _.
-      rewrite addZ_alt_def H_y_comp Z.compare_refl isok_cons.   
-      done.      
-    } {
-      move => l y c c' H_y_comp IH.
-      rewrite addZ_alt_def H_y_comp Z.compare_refl Z.eqb_refl.
-      rewrite !isok_cons.   
-      move => [H_inf1] [H_c_neq] [H_inf2] [H_c'_neq] H_ok_l.
-      split; last split => //. {
-        suff -> : (y + Z.of_N (c + c' + 1) =  y + Z.of_N c + 1 + Z.of_N c') by assumption.
-        rewrite !N2Z.inj_add /=.
-        ring.
-      }
-    } {
-      intros l y c z c'.
-      move => H_y_comp H_z_comp.
-      rewrite addZ_alt_def H_y_comp Z.compare_refl H_z_comp.
-      rewrite isok_cons => [] [] H_inf [] H_c_neq H_ok_l.
-      rewrite isok_cons.
-      split; last split; try done.
-      move : H_inf.
-      rewrite /inf. 
-      move : H_z_comp => /Z.eqb_neq H_z_neq /Z.ltb_lt H_z_lt.
-      apply Z.ltb_lt.
-
-      have -> : Z.of_N (c + 1) = Z.of_N c + 1. {
-        rewrite N2Z.inj_add //.
-      }
-
-      suff : y + (Z.of_N c + 1) <= z. {
-        rewrite Z.lt_eq_cases.
-        move => [] // H_z_eq.
-        contradict H_z_neq.
-        rewrite -H_z_eq.
-        ring.
-      }
-      suff H_suff : (Z.pred (y + (Z.of_N c + 1)) = y + Z.of_N c). {
-        apply Z.lt_pred_le.
-        by rewrite H_suff.
-      }
-      rewrite Z.add_1_r Z.add_succ_r Z.pred_succ //.
-    } {
-      intros x l y c H_y_comp H_x_comp.
-      rewrite addZ_alt_def H_y_comp H_x_comp //.
-    } {
-      intros x l y c H_y_comp H_x_comp IH.
-      rewrite addZ_alt_def H_y_comp H_x_comp.   
-      rewrite !isok_cons => [] [] H_inf [] H_c_neq H_ok_l.
-      split; last split; try done. {
-        suff : exists x0 c0 l0, addZ x l = (x0, c0)::l0 /\ (y+Z.of_N c < x0). {
-           move => [x0] [c0] [l0] [->].
-           rewrite /inf.
-           apply Z.ltb_lt.
-        }
-        apply Z.compare_gt_iff in H_x_comp.
-        move : H_inf.
-        case l. {
-          exists x, 1%N, nil.
-          by rewrite addZ_alt_def.
+      move => /interval_list_invariant_cons [H_greater] [H_c_neq_0]
+              H_inv_c'.
+      move : (IH H_inv_c') => {IH} IH.
+      rewrite addZ_alt_def.
+      have H_succ : forall z, z + Z.of_N 1 = Z.succ z by done.
+      move : (interval_1_compare_elim x z c).      
+      case_eq (interval_1_compare x (z, c)) => H_comp;
+        rewrite ?InZ_cons ?In_elementsZ_single1 ?H_succ ?Z.lt_succ_r //. {
+        move => H_z_gt.
+        rewrite interval_list_invariant_cons /= !andb_true_iff !H_succ.
+        repeat split => //. {
+          by apply Z.ltb_lt.
         } {
-          move =>  [z c'] l0 /Z.ltb_lt H_z_gt.
-          rewrite addZ_alt_def.
-          case (x + 1 ?= z); try by eauto.
-          case (x ?= z + Z.of_N c'); try by eauto.
-          case l0; try by eauto.
-          move => [z' c''] ?.
-          case (z' =? x + 1); by eauto.
+          apply negb_true_iff, N.eqb_neq => //.
         }
       } {
-        apply IH => //.
+        move => ?; subst.
+        rewrite /= !andb_true_iff.
+        repeat split => //. {
+          move : H_greater.
+          rewrite Z.add_succ_l -Z.add_succ_r N2Z.inj_succ //.
+        } {
+          apply negb_true_iff, N.eqb_neq => //.
+          apply N.neq_succ_0.
+        }
+      } {
+        move => [] // _.
+        rewrite interval_list_invariant_cons /=.
+        tauto.
+      } {
+        rewrite interval_list_invariant_cons.
+        move => H_lt_x.
+        repeat split => //.
+        apply interval_list_elements_greater_intro => //.
+        move => xx.
+        rewrite addZ_InZ => //.
+        move => [<- //|]. 
+        apply interval_list_elements_greater_alt2_def => //.
+      } {
+        move => H_x_eq.
+        apply insert_interval_begin_spec => //. {
+          eapply interval_list_elements_greater_impl; eauto.
+          apply Z_le_add_r.
+        } {
+          by apply N.neq_succ_0.
+        }
       }
     }
   Qed.
-
-
+  
   Global Instance add_ok s x : forall `(Ok s), Ok (add x s).
   Proof. 
     move => H_ok_s.
@@ -1322,13 +1872,13 @@ Module Raw (Enc : ElementEncode).
     rewrite /Ok /IsOk /is_encoded_elems_list /add.
     move => [H_isok_s] H_pre.
     split. {
-      apply addZ_isok => //.
+      apply addZ_invariant => //.
     } {
       intros y.
-      move : (addZ_spec s (Enc.encode x) y H_ok_s).
+      move : (addZ_InZ s (Enc.encode x) y H_isok_s).
       rewrite /InZ => ->.
       move => []. {
-        move => ->.
+        move => <-.
         by exists x.
       } {
         move => /H_pre //.
@@ -1343,253 +1893,8 @@ Module Raw (Enc : ElementEncode).
     intros s x y Hs.
     have Hs' := (add_ok s x Hs).
     rewrite !In_InZ.
-    rewrite /add addZ_spec Enc.encode_eq //.
-  Qed.
-
-
-  (** *** remove specification *)
-
-  Lemma isok_removeZ_aux_insert_guarded : forall x c s,
-    isok s = true -> inf (x + Z.of_N c) s = true ->
-    isok (removeZ_aux_insert_guarded x c s) = true.
-  Proof.
-    intros x c s.
-    rewrite /removeZ_aux_insert_guarded.
-    case_eq (c =? 0)%N => //.
-    move => /N.eqb_neq.
-    rewrite isok_cons.
-    tauto.
-  Qed.
-
-  Lemma inf_removeZ_aux_insert_guarded : forall x c y s,
-    inf y (removeZ_aux_insert_guarded x c s) = true <->
-    (if (c =? 0)%N then (inf y s = true) else (y < x)).
-  Proof.
-    intros x c y s.
-    rewrite /removeZ_aux_insert_guarded.
-    case (c =? 0)%N => //.       
-    rewrite /inf Z.ltb_lt //.
-  Qed.
-
-
-  Lemma removeZ_counter_pos_aux : forall y c x,
-     x < y + Z.of_N c ->
-     0 <= y + Z.of_N c - Z.succ x.
-  Proof.
-    intros y c x H_x_lt.
-    rewrite Z.le_0_sub Z.le_succ_l.
-    assumption.
-  Qed.
-
-  Lemma removeZ_isok : forall s x, isok s = true -> isok (removeZ x s) = true.
-  Proof.
-    intros s x.
-    induction s as [| [y c] s' IH]. {
-      rewrite removeZ_alt_def //.
-    } {
-      rewrite removeZ_alt_def.
-      case_eq (x <? y) => //.
-      move => /Z.ltb_ge H_y_le_x.
-      case_eq (x <? y + Z.of_N c). {
-        move => /Z.ltb_lt H_x_lt /isok_cons [H_inf] [H_c_neq] H_ok_s'.
-        apply isok_removeZ_aux_insert_guarded; first apply isok_removeZ_aux_insert_guarded. {
-          assumption.
-        } {
-          rewrite Z2N.id; last by apply removeZ_counter_pos_aux.
-          rewrite add_add_sub_eq.
-          assumption.
-        } {
-          rewrite /removeZ_aux_insert_guarded Z2N.id; last first. {
-            by rewrite Z.le_0_sub.
-          }
-          rewrite add_add_sub_eq.
-          case  (Z.to_N (y + Z.of_N c - Z.succ x) =? 0)%N. {
-            eapply inf_impl; eauto.
-            by apply Z.lt_le_incl.
-          } {
-            rewrite /inf.
-            apply Z.ltb_lt, Z.lt_succ_diag_r.
-          }
-        }
-      } {
-        move => /Z.ltb_ge H_yc_le_x.
-        rewrite !isok_cons.
-        move => [H_inf] [H_c_neq] H_ok_s'.
-        split; last split => //; last by apply IH. 
-        move : H_inf.
-        case_eq s' => //.
-        move => [z c'] l' H_s'_eq.
-        rewrite removeZ_alt_def.
-        case (x <? z); first by eauto.
-        case (x <? z + Z.of_N c'); last by eauto.
-        move => /Z.ltb_lt H_lt_z.
-        rewrite inf_removeZ_aux_insert_guarded.
-        case (Z.to_N (x - z) =? 0)%N => //.
-        rewrite inf_removeZ_aux_insert_guarded.
-        case (Z.to_N (z + Z.of_N c' - Z.succ x) =? 0)%N. {
-          move : H_ok_s'.
-          rewrite H_s'_eq !isok_cons.
-          move => [H_inf] _.
-          eapply inf_impl; last apply H_inf.
-          apply Z.le_trans with (m := z). {
-            by apply Z.lt_le_incl.
-          } {
-            by apply Z_le_add_r.
-          }
-        } {
-          rewrite Z.lt_succ_r //.
-        }
-      }
-    }
-  Qed.
-
-
-  Lemma elementsZ_removeZ_aux_insert_guarded : forall x c s,
-    elementsZ (removeZ_aux_insert_guarded x c s) = elementsZ ((x, c) :: s). 
-  Proof.
-    intros x c s.
-    rewrite /removeZ_aux_insert_guarded.
-    case_eq (c =? 0)%N => //.
-    move => /N.eqb_eq ->.
-    rewrite elementsZ_cons elementsZ_single_base /= app_nil_r //.
-  Qed.
- 
-  Lemma removeZ_spec :
-   forall (s : t) (x y : Z) (Hs : isok s = true),
-    InZ y (removeZ x s) <-> InZ y s /\ ~Z.eq y x.
-  Proof.
-    intros s x y Hs.
-    move : Hs x y.
-    induction s as [| [y c] s' IH] . {
-      move => _ x y.
-      rewrite /=.
-      firstorder.
-    } {
-      intros H_ok x y0.
-      rewrite removeZ_alt_def.
-      case_eq (x <? y). {
-        move => /Z.ltb_lt H_x_lt.
-        split; last tauto.
-        move => H_in.
-        split => // H_y0_eq.
-        apply (isok_inf_nin y0 ((y, c)::s')) => //.
-        rewrite /inf H_y0_eq. 
-        by apply Z.ltb_lt.        
-      } {
-        move => /Z.ltb_ge H_y_le.
-        have H_ok' : isok s' = true. {
-          move : H_ok.
-          rewrite isok_cons; tauto.
-        } 
-        move : (IH H_ok') => {IH} IH.
-        case_eq (x <? y + Z.of_N c). {
-          move => /Z.ltb_lt H_x_lt /=.
-          rewrite /InZ elementsZ_removeZ_aux_insert_guarded !elementsZ_cons.
-          rewrite elementsZ_removeZ_aux_insert_guarded elementsZ_cons !in_app_iff -!in_rev.
-          rewrite !In_elementsZ_single !Z2N.id; last first. {
-            by apply removeZ_counter_pos_aux.
-          } {
-            by rewrite Z.le_0_sub.
-          }
-          rewrite !add_add_sub_eq Z.le_succ_l.
-          case_eq (y0 =? x). {
-            move => /Z.eqb_eq ->.
-            split; last first. {
-              move => [_] H_neq.
-              contradict H_neq => //.
-            } {
-              move => [[] |]. {
-                move => H_in. exfalso.
-                apply (isok_inf_nin x s') => //.
-                move : H_ok.
-                case s' => //.
-                move => [z c'] s''.
-                rewrite !isok_cons /inf.
-                move => [] /Z.ltb_lt H_lt_x' _.
-                apply Z.ltb_lt.
-                eapply Z.lt_trans; eauto.
-              } {
-                move => [] /Z.lt_irrefl //.
-              } {
-                move => [_] /Z.lt_irrefl //.
-              }
-            } 
-          }
-          move => /Z.eqb_neq H_y0_neq.
-          split. {
-            move => H.
-            split; last by apply H_y0_neq.
-            move : H => [[] |]. {
-              by left.
-            } {
-              move => [H_x_lt'] H_y0_lt.
-              right; split => //.
-              apply Z.le_trans with (m := x) => //.
-              by apply Z.lt_le_incl.
-            } {
-              move => [H_y_le'] H_y0_lt.
-              right; split => //.
-              eapply Z.lt_trans; eauto.
-            }
-          } {
-            move => [[]]; first by tauto.
-            move => [H_y_le'] H_y0_lt _.
-            case_eq (y0 <? x). {
-              move => /Z.ltb_lt H_y0_lt_x.
-              right. done.
-            } {
-              move => /Z.ltb_ge /Z.lt_eq_cases []. {
-                move => H_x_lt'.
-                left; right.
-                done.
-              } {
-                move => H_x_eq.
-                contradict H_y0_neq => //.
-              }
-            }
-          } 
-        } {
-          move => /Z.ltb_ge H_yc_le.
-          unfold InZ in IH.
-          rewrite /InZ !elementsZ_cons !in_app_iff !IH.
-          split; last tauto.
-          move => []; first tauto.
-          rewrite -!in_rev In_elementsZ_single.
-          move => [H_y_le'] H_y0_lt.
-          split; first by right.        
-          move => H_y0_eq.
-          move : H_y0_lt.
-          apply Z.nlt_ge.
-          by rewrite H_y0_eq.
-        }
-      }
-    }
-  Qed.
-
-
-  Global Instance remove_ok s x : forall `(Ok s), Ok (remove x s).
-  Proof.
-    rewrite /Ok /IsOk /remove.
-    move => [H_is_ok_s H_enc_s].
-    split. {
-      by apply removeZ_isok.
-    } {
-      rewrite /is_encoded_elems_list => y.
-      move : (removeZ_spec s (Enc.encode x) y H_is_ok_s).
-      rewrite /InZ => -> [] H_y_in _.
-      apply H_enc_s => //.
-    }
-  Qed.
-
-  Lemma remove_spec :
-   forall (s : t) (x y : elt) (Hs : Ok s),
-    In y (remove x s) <-> In y s /\ ~Enc.E.eq y x.
-  Proof.
-    intros s x y Hs.
-    have H_rs := (remove_ok s x Hs).
-    rewrite /remove !In_InZ.
-    rewrite removeZ_spec. {
-      rewrite Enc.encode_eq //.
+    rewrite /add addZ_InZ. {
+      rewrite -Enc.encode_eq; firstorder.
     } {
       apply Hs.
     }
@@ -1689,52 +1994,970 @@ Module Raw (Enc : ElementEncode).
     }
   Qed.
 
-  (** *** remove_list specification *)
-
-  Lemma remove_list_ok : forall l s, Ok s -> Ok (remove_list l s).
-  Proof.
-    induction l as [| x l' IH]. {
-      done.
-    } {
-      move => s H_s_ok /=.
-      apply IH.
-      by apply remove_ok.
-    }
-  Qed.
-
-  Lemma remove_list_spec : forall x l s, Ok s -> 
-     (In x (remove_list l s) <-> ~(InA Enc.E.eq x l) /\ In x s).
-  Proof.
-    move => x.
-    induction l as [| y l' IH]. {
-      intros s H.
-      rewrite /= InA_nil.
-      tauto.
-    } {
-      move => s H_ok /=.
-      rewrite IH remove_spec InA_cons.
-      tauto.
-    }
-  Qed.
-
   (** *** union specification *)
 
-  Global Instance union_ok s s' : forall `(Ok s, Ok s'), Ok (union s s').
+  Lemma union_aux_flatten_alt_def : forall (s1 s2 : t) acc, 
+    union_aux s1 s2 acc =
+    match (s1, s2) with
+    | (nil, _) => List.rev_append acc s2
+    | (_, nil) => List.rev_append acc s1
+    | ((y1, c1) :: l1, (y2, c2) :: l2) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => union_aux l1 s2 ((y1, c1)::acc)
+          | ICR_before_touch => 
+              union_aux l1 (
+                insert_interval_begin y1 ((c1+c2)%N) l2) acc
+          | ICR_after        => union_aux s1 l2 ((y2, c2)::acc)
+          | ICR_after_touch  => union_aux l1 (
+              insert_interval_begin y2 ((c1+c2)%N) l2) acc
+          | ICR_overlap_before => 
+              union_aux l1 (
+                insert_interval_begin y1 
+                  (merge_interval_size y1 c1 y2 c2) l2) acc
+          | ICR_overlap_after => 
+              union_aux l1 (
+                insert_interval_begin y2 
+                  (merge_interval_size y2 c2 y1 c1) l2) acc
+          | ICR_equal => union_aux l1 s2 acc
+          | ICR_subsume_1 => union_aux l1 s2 acc
+          | ICR_subsume_2 => union_aux s1 l2 acc
+        end
+    end.
   Proof.
-    move => H_ok H_ok'.
-    rewrite /union.
-    by apply add_list_ok.
+    intros s1 s2 acc.    
+    case s1, s2 => //. 
   Qed.
-    
+
+  Lemma union_aux_alt_def : forall (s1 s2 : t) acc, 
+    union_aux s1 s2 acc =
+    List.rev_append acc (union s1 s2).
+  Proof.
+    rewrite /union.
+    intros s1 s2 acc.
+    move : acc s2.
+    induction s1 as [| [y1 c1] l1 IH1]. {
+      intros acc s2.
+      rewrite !union_aux_flatten_alt_def.
+      rewrite !rev_append_rev //.
+    }
+    intros acc s2; move : acc.
+    induction s2 as [| [y2 c2] l2 IH2]; first by simpl.
+    move => acc.
+    rewrite !(union_aux_flatten_alt_def ((y1, c1)::l1) ((y2, c2)::l2)).
+    case (interval_compare (y1, c1) (y2, c2));
+      rewrite ?(IH1 ((y1, c1) :: acc)) ?(IH1 ((y1, c1) :: nil))
+              ?(IH2 ((y2, c2) :: acc)) ?(IH2 ((y2, c2) :: nil))
+              ?(IH1 acc) //.
+  Qed.
+
+  Lemma union_alt_def : forall (s1 s2 : t), 
+    union s1 s2 =
+    match (s1, s2) with
+    | (nil, _) => s2
+    | (_, nil) => s1
+    | ((y1, c1) :: l1, (y2, c2) :: l2) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => (y1, c1) :: (union l1 s2)
+          | ICR_before_touch => 
+              union l1 (insert_interval_begin y1 ((c1+c2)%N) l2)
+          | ICR_after        => (y2, c2) :: union s1 l2
+          | ICR_after_touch  => union l1 
+              (insert_interval_begin y2 ((c1+c2)%N) l2)
+          | ICR_overlap_before => 
+              union l1 (insert_interval_begin y1 (merge_interval_size y1 c1 y2 c2) l2)
+          | ICR_overlap_after => 
+              union l1 (insert_interval_begin y2 (merge_interval_size y2 c2 y1 c1) l2)
+          | ICR_equal => union l1 s2 
+          | ICR_subsume_1 => union l1 s2 
+          | ICR_subsume_2 => union s1 l2
+        end
+     end.
+  Proof.
+    intros s1 s2.
+    rewrite /union union_aux_flatten_alt_def.
+    case s1 as [| [y1 c1] l1] => //.
+    case s2 as [| [y2 c2] l2] => //.
+    case (interval_compare (y1, c1) (y2, c2));
+      rewrite union_aux_alt_def //.
+  Qed.
+
+  Lemma union_InZ :
+   forall (s1 s2 : t),
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    forall y, (InZ y (union s1 s2) <-> InZ y s1 \/ InZ y s2).
+  Proof.
+    intro s1.
+    induction s1 as [| [y1 c1] l1 IH1]. {
+      intros s2 _ _ y.
+      rewrite union_alt_def /InZ /=.
+      tauto.
+    } {
+      induction s2 as [| [y2 c2] l2 IH2]. {
+        intros _ _ y.
+        rewrite union_alt_def /InZ /=.
+        tauto.
+      } {
+        move => H_inv_s1 H_inv_s2.
+        move : (H_inv_s1) (H_inv_s2).
+        rewrite !interval_list_invariant_cons.
+        move => [H_gr_l1] [H_c1_neq_0] H_inv_l1.
+        move => [H_gr_l2] [H_c2_neq_0] H_inv_l2.
+        move : (IH2 H_inv_s1 H_inv_l2) => {IH2} IH2.
+        have :  forall s2 : t,
+          interval_list_invariant s2 = true ->
+          forall y : Z, InZ y (union l1 s2) <-> InZ y l1 \/ InZ y s2. {
+          intros. by apply IH1.
+        }
+        move => {IH1} IH1 y.
+        rewrite union_alt_def.
+        move : (interval_compare_elim y1 c1 y2 c2).
+        case (interval_compare (y1, c1) (y2, c2)). {
+          rewrite !InZ_cons IH1 // InZ_cons.
+          tauto.
+        } {
+          move => H_y2_eq.
+          replace (c1 + c2)%N with (merge_interval_size y1 c1 y2 c2);
+            last first. {
+            rewrite -H_y2_eq merge_interval_size_add //.
+          }
+          set c'' := merge_interval_size y1 c1 y2 c2.
+          have [H_inv_insert H_InZ_insert] : 
+               interval_list_invariant (insert_interval_begin y1 c'' l2) = true /\
+                (InZ y (insert_interval_begin y1 c'' l2) <->
+                List.In y (elementsZ_single y1 c'') \/ InZ y l2). {
+            apply insert_interval_begin_spec => //. {
+              eapply interval_list_elements_greater_impl; eauto.
+              rewrite -H_y2_eq -Z.add_assoc -N2Z.inj_add.
+              apply Z_le_add_r.
+            } {
+              by apply merge_interval_size_neq_0.
+            } 
+          }
+  
+          rewrite IH1 => //.
+          rewrite H_InZ_insert !InZ_cons /c''.
+          rewrite -H_y2_eq In_merge_interval. {
+            tauto.
+          } {
+            apply Z_le_add_r.
+          } {
+            by apply Z.le_refl.
+          }
+        } {
+          move => [H_y1_lt] [H_y2_lt] H_y1_c1_lt.
+          set c'' := merge_interval_size y1 c1 y2 c2.
+          have [H_inv_insert H_InZ_insert] : 
+               interval_list_invariant (insert_interval_begin y1 c'' l2) = true /\
+                (InZ y (insert_interval_begin y1 c'' l2) <->
+                List.In y (elementsZ_single y1 c'') \/ InZ y l2). {
+            apply insert_interval_begin_spec => //. {
+              eapply interval_list_elements_greater_impl; eauto.
+              apply Z_lt_le_add_r => //.
+            } {
+              by apply merge_interval_size_neq_0.
+            } 
+          }
+          rewrite IH1 => //.
+          rewrite H_InZ_insert !InZ_cons /c''.
+          rewrite In_merge_interval. {
+            tauto.
+          } {
+            by apply Z.lt_le_incl.
+          } {
+            by apply Z.lt_le_incl.
+          }
+        } {
+          move => [H_y2_lt] [H_y1_lt] H_y2_c_lt.
+          set c'' := merge_interval_size y2 c2 y1 c1.
+          have [H_inv_insert H_InZ_insert] : 
+               interval_list_invariant (insert_interval_begin y2 c'' l2) = true /\
+                (InZ y (insert_interval_begin y2 c'' l2) <->
+                List.In y (elementsZ_single y2 c'') \/ InZ y l2). {
+            apply insert_interval_begin_spec => //. {
+              eapply interval_list_elements_greater_impl; eauto.
+              apply Z_le_add_r.
+            } {
+              by apply merge_interval_size_neq_0.
+            } 
+          }
+  
+          rewrite IH1 => //.
+          rewrite H_InZ_insert !InZ_cons /c''.
+          rewrite In_merge_interval. {
+            tauto.
+          } {
+            by apply Z.lt_le_incl.
+          } {
+            by apply Z.lt_le_incl.
+          }
+        } {
+          move => [? ?]; subst.
+          rewrite IH1 => //.
+          rewrite !InZ_cons. 
+          tauto.
+        } {
+          move => [H_y2_le] [H_y1_c1_le] _.
+          rewrite IH1 => //.
+          rewrite !InZ_cons. 
+          suff : (List.In y (elementsZ_single y1 c1) ->
+                  List.In y (elementsZ_single y2 c2)). {
+            tauto.
+          }
+          rewrite !In_elementsZ_single.
+          move => [H_y1_le H_y_lt].
+          split; omega.
+        } {
+          move => [H_y1_le] [H_y2_c2_le] _.
+          rewrite IH2.
+          rewrite !InZ_cons. 
+          suff : (List.In y (elementsZ_single y2 c2) ->
+                  List.In y (elementsZ_single y1 c1)). {
+            tauto.
+          }
+          rewrite !In_elementsZ_single.
+          move => [H_y2_le H_y_lt].
+          split; omega.
+        } {
+          rewrite !InZ_cons IH2 !InZ_cons.
+          tauto.
+        } {
+          move => H_y1_eq.
+          replace (c1 + c2)%N with (merge_interval_size y2 c2 y1 c1);
+            last first. {
+            rewrite -H_y1_eq merge_interval_size_add N.add_comm //.
+          }
+          set c'' := merge_interval_size y2 c2 y1 c1.
+          have [H_inv_insert H_InZ_insert] : 
+               interval_list_invariant (insert_interval_begin y2 c'' l2) = true /\
+                (InZ y (insert_interval_begin y2 c'' l2) <->
+                List.In y (elementsZ_single y2 c'') \/ InZ y l2). {
+            apply insert_interval_begin_spec => //. {
+              eapply interval_list_elements_greater_impl; eauto.
+              apply Z_le_add_r.
+            } {
+              by apply merge_interval_size_neq_0.
+            } 
+          }
+  
+          rewrite IH1 => //.
+          rewrite H_InZ_insert !InZ_cons /c''.
+          rewrite -H_y1_eq In_merge_interval. {
+            tauto.
+          } {
+            apply Z_le_add_r.
+          } {
+            by apply Z.le_refl.
+          }
+        }
+      }
+    }
+  Qed.
+
+  Lemma union_invariant :
+   forall (s1 s2 : t),
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    interval_list_invariant (union s1 s2) = true.
+  Proof.
+    intro s1.
+    induction s1 as [| [y1 c1] l1 IH1]. {
+      intros s2 _ H_inv_s2.
+      rewrite union_alt_def /InZ //.
+    } {
+      induction s2 as [| [y2 c2] l2 IH2]. {
+        intros H_inv_s1 _.
+        rewrite union_alt_def /InZ //.
+      } {
+        move => H_inv_s1 H_inv_s2.
+        move : (H_inv_s1) (H_inv_s2).
+        rewrite !interval_list_invariant_cons.
+        move => [H_gr_l1] [H_c1_neq_0] H_inv_l1.
+        move => [H_gr_l2] [H_c2_neq_0] H_inv_l2.
+        move : (IH2 H_inv_s1 H_inv_l2) => {IH2} IH2.
+        have :  forall s2 : t,
+          interval_list_invariant s2 = true ->
+          interval_list_invariant (union l1 s2) = true. {
+          intros. by apply IH1.
+        }
+        move => {IH1} IH1.
+
+        rewrite union_alt_def.
+        move : (interval_compare_elim y1 c1 y2 c2).
+        case (interval_compare (y1, c1) (y2, c2)). {
+          move => H_lt_y2.
+          have H_inv' : interval_list_invariant (union l1 ((y2, c2) :: l2)) = true. {
+            by apply IH1.
+          }
+
+          rewrite interval_list_invariant_cons.
+          repeat split => //. 
+          apply interval_list_elements_greater_intro => // x.
+          rewrite union_InZ => //.
+          move => []. {
+            apply interval_list_elements_greater_alt2_def => //.
+          } {
+            apply interval_list_elements_greater_alt2_def => //.
+            rewrite interval_list_elements_greater_cons //.
+          }
+        } {
+          move => H_y2_eq.
+          apply IH1.
+          apply insert_interval_begin_spec => //. {
+            eapply interval_list_elements_greater_impl; last apply H_gr_l2.
+            rewrite -H_y2_eq -Z.add_assoc -N2Z.inj_add.
+            apply Z_le_add_r.
+          } {
+            rewrite N.eq_add_0.
+            tauto.
+          }
+        } {
+          move => [H_y1_lt] _.
+          apply IH1. 
+          apply insert_interval_begin_spec => //. {
+            eapply interval_list_elements_greater_impl; last apply H_gr_l2.
+            apply Z_lt_le_add_r => //.
+          } {
+            apply merge_interval_size_neq_0 => //.
+          }
+        } {
+          move => [H_y2_lt] _.
+          apply IH1.
+          apply insert_interval_begin_spec => //. {
+            eapply interval_list_elements_greater_impl; last apply H_gr_l2.
+            apply Z_le_add_r => //.
+          } {
+            apply merge_interval_size_neq_0 => //.
+          }
+        } {
+          move => [? ?]; subst.
+          apply IH1 => //. 
+        } {
+          move => _.
+          apply IH1 => //. 
+        } {
+          move => _.
+          apply IH2 => //. 
+        } {
+          move => H_lt_y1.
+          rewrite interval_list_invariant_cons => //.
+          repeat split => //.
+          apply interval_list_elements_greater_intro => // x.
+          rewrite union_InZ => //.
+          move => []. {
+            apply interval_list_elements_greater_alt2_def => //.
+            rewrite interval_list_elements_greater_cons //.
+          } {
+            apply interval_list_elements_greater_alt2_def => //.
+          }
+        } {
+          move => H_y1_eq.
+          apply IH1 => //.
+          apply insert_interval_begin_spec => //. {
+            eapply interval_list_elements_greater_impl; last apply H_gr_l2.
+            apply Z_le_add_r.
+          } {
+            rewrite N.eq_add_0.
+            tauto.
+          }
+        }
+      }
+    }
+  Qed.
+
+ 
+  Global Instance union_ok s1 s2 : forall `(Ok s1, Ok s2), Ok (union s1 s2).
+  Proof.
+    move => H_ok_s1 H_ok_s2.
+    move : (H_ok_s1) (H_ok_s2).
+    rewrite /Ok /IsOk /is_encoded_elems_list /add.
+    move => [H_inv_s1] H_pre1.
+    move => [H_inv_s2] H_pre2.
+    split. {
+      apply union_invariant => //.
+    } {
+      intros y.
+      move : (union_InZ s1 s2 H_inv_s1 H_inv_s2).    
+      rewrite /InZ => ->.      
+      move => []. {
+        apply H_pre1.
+      } {
+        apply H_pre2.
+      }
+    }
+  Qed.
+
   Lemma union_spec :
    forall (s s' : t) (x : elt) (Hs : Ok s) (Hs' : Ok s'),
    In x (union s s') <-> In x s \/ In x s'.
   Proof.
     intros s s' x H_ok H_ok'.
-    rewrite /union add_list_spec //.
+    rewrite !In_InZ.
+    rewrite union_InZ => //. {
+      apply H_ok.
+    } {
+      apply H_ok'.
+    }
   Qed.
 
 
+  (** *** inter specification *)
+ 
+  Lemma inter_aux_alt_def :
+    forall (y2 : Z) (c2 : N) (s : t) acc,
+      inter_aux y2 c2 acc s = match inter_aux y2 c2 nil s with
+                               (acc', s') => (acc' ++ acc, s')
+                             end.
+  Proof.
+    intros y2 c2.
+    induction s as [| [y1 c1] s' IH] => acc. {
+      rewrite /inter_aux app_nil_l //.
+    } {
+      simpl.
+      case_eq (inter_aux y2 c2 nil s') => acc'' s'' H_eq.
+      case (interval_compare (y1, c1) (y2, c2));
+        rewrite ?(IH acc)
+                ?(IH ((y2, Z.to_N (y1 + Z.of_N c1 - y2)) :: acc))
+                ?(IH ((y2, Z.to_N (y1 + Z.of_N c1 - y2)) :: nil))
+                ?(IH ((y1, Z.to_N (y2 + Z.of_N c2 - y1)) :: acc))
+                ?(IH ((y1, Z.to_N (y2 + Z.of_N c2 - y1)) :: nil))
+                ?(IH ((y1, c1) :: acc))
+                ?(IH ((y1, c1) :: nil))
+                
+                ?H_eq -?app_assoc -?app_comm_cons //.     
+    }
+  Qed.
+
+  Lemma inter_aux_props :
+    forall (y2 : Z) (c2 : N) (s : t) acc,
+      interval_list_invariant (rev acc) = true ->
+      interval_list_invariant s = true ->
+      (forall x1 x2, InZ x1 acc -> InZ x2 s ->
+                     List.In x2 (elementsZ_single y2 c2) ->
+                     Z.succ x1 < x2) ->
+      (c2 <> 0%N) ->
+      match (inter_aux y2 c2 acc s) with (acc', s') =>
+        (forall y, (InZ y acc' <->
+                   (InZ y acc \/ (InZ y s /\ (List.In y (elementsZ_single y2 c2)))))) /\
+        (forall y, InZ y s' -> InZ y s) /\
+        (forall y, InZ y s -> y2 + Z.of_N c2 < y -> InZ y s') /\
+        interval_list_invariant (rev acc') = true /\
+        interval_list_invariant s' = true
+      end.
+  Proof.
+    intros y2 c2.     
+    induction s as [| [y1 c1] s1' IH] => acc. {
+      rewrite /inter_aux.       
+      move => H_inv_acc _ _ _.
+      split; last split; try done.
+      move => y. rewrite InZ_nil.
+      tauto.
+    } {
+      rewrite interval_list_invariant_cons.       
+      move => H_inv_acc [H_gr_s1'] [H_c1_neq_0] H_inv_s1'.
+      move => H_in_acc_lt H_c2_neq_0.
+       
+      rewrite inter_aux_alt_def.
+      case_eq (inter_aux y2 c2 nil ((y1, c1) :: s1')).
+      move => acc' s' H_inter_aux_eq.
+
+      set P1 := forall y : Z,
+        (InZ y acc' <->
+        ((InZ y ((y1, c1) :: s1') /\ List.In y (elementsZ_single y2 c2)))).
+      set P2 := (forall y,
+                  (InZ y s' -> InZ y ((y1, c1) :: s1')) /\
+                  (InZ y ((y1, c1) :: s1') ->
+                     y2 + Z.of_N c2 < y -> InZ y s')).
+      set P3 := interval_list_invariant (rev acc') = true.
+      set P4 := interval_list_invariant s' = true.
+
+      suff : (P1 /\ P2 /\ P3 /\ P4). {
+        move => [H_P1] [H_P2] [H_P3] H_P4.
+        split; last split; last split; last split. {
+          move => y.
+          move : (H_P1 y).
+          rewrite !InZ_app InZ_cons !In_elementsZ_single.
+          move => <-.
+          tauto.
+        } {
+          move => y H_y_in.
+          by apply H_P2.
+        } {
+          move => y H_y_in.
+          by apply H_P2.
+        } {
+          rewrite rev_app_distr.
+          apply interval_list_invariant_app_intro => //.
+          move => x1 x2.
+          rewrite !InZ_rev.
+          move => H_x1_in /H_P1 [H_x2_in1] H_x2_in2.
+          apply H_in_acc_lt => //.
+        } {
+          apply H_P4.
+        }
+      }
+
+      move : (H_gr_s1').
+      rewrite interval_list_elements_greater_alt2_def => // => H_gr_s1'_alt.
+
+      have : forall (acc : list (Z * N)),
+        interval_list_invariant (rev acc) = true ->
+        (forall y, InZ y acc <-> (
+           y1 <= y < y1 + Z.of_N c1 /\
+           y2 <= y < y2 + Z.of_N c2)) ->
+        (y1 + Z.of_N c1 <= y2 + Z.of_N c2) ->        
+        (inter_aux y2 c2 acc s1' = (acc', s')) ->
+        P1 /\ P2 /\ P3 /\ P4. {
+        
+        intros acc0 H_inv_acc0 H_in_acc0 H_y2c_lt H_inter_aux_eq0.
+        have H_in_acc0_lt : (forall x1 x2 : Z,
+          InZ x1 acc0 ->
+          InZ x2 s1' ->
+          List.In x2 (elementsZ_single y2 c2) ->
+          Z.succ x1 < x2). {
+
+          intros x1 x2 H_x1_in_acc0 H_x2_in_s1' H_x2_in_yc2.
+
+          suff H_yc1_lt_x2 : Z.succ x1 <= y1 + Z.of_N c1. {
+            apply Z.le_lt_trans with (m := y1 + Z.of_N c1) => //.
+            by apply H_gr_s1'_alt.
+          }
+          move : (H_x1_in_acc0).
+          rewrite H_in_acc0 Z.le_succ_l.
+          tauto.
+        }          
+        
+        move : (IH acc0 H_inv_acc0 H_inv_s1' H_in_acc0_lt H_c2_neq_0).
+        rewrite H_inter_aux_eq0.
+        move => [H1] [H2] [H3] [H4] H5.
+        split; last split => //. {
+          move => y.
+          rewrite (H1 y).
+          rewrite InZ_cons !In_elementsZ_single
+                  H_in_acc0.
+          tauto.
+        } {
+          move => y.
+          split. {
+            move => /H2.
+            rewrite InZ_cons.
+            by right.
+          } {
+            rewrite InZ_cons In_elementsZ_single.
+            move => []. {
+              move => [_] H_y_lt H_lt_y.
+              exfalso.
+              suff : (y < y) by apply Z.lt_irrefl.
+              apply Z.lt_le_trans with (m := y1 + Z.of_N c1) => //.
+              apply Z.le_trans with (m := y2 + Z.of_N c2) => //.
+
+              by apply Z.lt_le_incl.
+            } {
+              apply H3.
+            }
+          }
+        } 
+      }
+      move => {IH} IH.
+         
+      clear H_inv_acc H_in_acc_lt acc.
+      move : (interval_compare_elim y1 c1 y2 c2) H_inter_aux_eq.
+      unfold inter_aux.
+      case_eq (interval_compare (y1, c1) (y2, c2)) => H_comp;
+         fold inter_aux. {
+        move => H_lt_y2.
+        apply IH. {
+          done.
+        } {
+          move => x.
+          rewrite InZ_nil.
+          split => //.
+          omega.
+        } {
+          apply Z.le_trans with (m := y2). {
+            by apply Z.lt_le_incl.
+          } {
+            apply Z_le_add_r.
+          }
+        }          
+      } {
+        move => H_eq_y2. 
+        apply IH. {
+          done.
+        } {
+          move => x.
+          rewrite InZ_nil.
+          split => //.
+          omega.
+        } {
+          rewrite H_eq_y2.
+          apply Z_le_add_r.
+        }          
+      } {
+        move => [H_y1_lt_y2] [H_y2_lt_yc1] H_yc1_lt_yc2.
+        apply IH. {
+          rewrite interval_list_invariant_sing.
+          by apply Z_to_N_minus_neq_0.
+        } {
+          move => x.
+          rewrite InZ_cons InZ_nil In_elementsZ_single Z2N.id; last omega.
+          replace (y1 + (y2 - y1)) with y2 by omega.
+          split; omega.
+        } {
+          by apply Z.lt_le_incl.
+        }
+      } {
+        rewrite /P1 /P2 /P3 /P4.
+        move => [H_y2_lt] [H_y1_lt] H_yc1_lt.
+        move => [] H_acc' H_s'.
+        clear IH P1 P2 P3 P4 H_comp.
+        subst s' acc'.
+        split; last split; last split. {          
+          move => y.
+          have H_yc2_intro : y1 + Z.of_N (Z.to_N (y2 + Z.of_N c2 - y1)) =
+                             y2 + Z.of_N c2. {
+            rewrite Z2N.id; omega.
+          }       
+          
+          rewrite !InZ_cons !In_elementsZ_single InZ_nil H_yc2_intro.
+          split. {
+            move => [] //.
+            move => [H_y1_le] H_y_lt.
+            split; last by omega.
+            left. omega.
+          } {
+            move => [H_in_s] [H_y2_le] H_y_lt.
+            left.
+            split; last assumption.
+            move : H_in_s => []. {
+              tauto.
+            } {              
+              move => /H_gr_s1'_alt H_lt_y.
+              apply Z.le_trans with (m := y1 + Z.of_N c1). {
+                by apply Z_le_add_r.
+              } {
+                by apply Z.lt_le_incl.
+              }
+            }
+          }
+        } {
+          move => y.
+          split; done.
+        } {
+          rewrite interval_list_invariant_sing.
+          by apply Z_to_N_minus_neq_0.
+        } {
+          by rewrite interval_list_invariant_cons.
+        }
+      } {
+        rewrite /P1 /P2 /P3 /P4.
+        move => [H_y12_eq] H_c12_eq [] H_acc' H_s'.
+        clear IH P1 P2 P3 P4 H_comp.
+        subst.
+        split; last split; last split. {
+          move => y.
+          rewrite !InZ_cons InZ_nil In_elementsZ_single.
+          split; last by tauto. {         
+            move => [] //.
+            tauto.
+          }
+        } {
+          move => y.
+          rewrite InZ_cons In_elementsZ_single.
+          split; first by right.
+          move => [] //.
+          move => [_] H_y_lt H_lt_y.
+          exfalso.
+          suff : (y2 + Z.of_N c2 < y2 + Z.of_N c2) by
+              apply Z.lt_irrefl.
+          apply Z.lt_trans with (m := y) => //.
+        } {
+          rewrite interval_list_invariant_sing //.          
+        } {
+          assumption.
+        }        
+      } {
+        move => [H_y2_le_y1] [H_yc1_le_yc2] _.
+        apply IH. {
+          by rewrite interval_list_invariant_sing.
+        } {
+          move => y.
+          rewrite InZ_cons InZ_nil In_elementsZ_single.
+          split. {
+            move => [] //.
+            move => [H_y1_le] H_y_lt.
+            split; first done.
+            split; omega.
+          } {
+            move => [?] _.
+            by left.
+          }
+        } {
+          assumption.
+        }          
+      } {
+        rewrite /P1 /P2 /P3 /P4.
+        move => [H_y1_le] [H_yc2_le] _.
+        move => [] H_acc' H_s'.
+        clear IH P1 P2 P3 P4 H_comp.
+        subst.
+        split; last split; last split. {          
+          move => y.
+          rewrite !InZ_cons !In_elementsZ_single InZ_nil.
+          split. {
+            move => [] //.
+            move => [H_y2_le] H_y_lt.
+            split; last by omega.
+            left. omega.
+          } {
+            move => [H_in_s] [H_y2_le] H_y_lt.
+            by left.
+          }
+        } {
+          tauto.
+        } {
+          by rewrite interval_list_invariant_sing.
+        } {
+          by rewrite interval_list_invariant_cons.
+        }
+      } {
+        rewrite /P1 /P2 /P3 /P4.
+        move => H_yc2_lt [] H_acc' H_s'.
+        clear IH P1 P2 P3 P4 H_comp.
+        subst.
+        split; last split; last split. {
+          move => y.
+          rewrite InZ_cons !In_elementsZ_single InZ_nil.
+          split; first done.
+          move => [] []. {
+            move => [H_y1_le_y] H_y_lt_yc1.
+            move => [H_y2_le_y] H_y_lt_yc2.
+            omega.
+          } {
+            move => /H_gr_s1'_alt H_lt_y [_] H_y_lt.
+            suff : (y1 + Z.of_N c1 < y1). {
+              apply Z.nlt_ge.
+              apply Z_le_add_r.
+            }
+            omega.
+          }
+        } {
+          tauto.
+        } {
+          done.
+        } {
+          by rewrite interval_list_invariant_cons.
+        }         
+      } {
+        rewrite /P1 /P2 /P3 /P4.
+        move => H_y1_eq [] H_acc' H_s'.
+        clear IH P1 P2 P3 P4 H_comp.
+        subst acc' s'.
+        split; last split; last split. {
+          move => y.
+          rewrite InZ_cons !In_elementsZ_single InZ_nil.
+          split; first done.
+          move => [] []. {
+            move => [H_y1_le_y] H_y_lt_yc1.
+            move => [H_y2_le_y] H_y_lt_yc2.
+            omega.
+          } {
+            move => /H_gr_s1'_alt H_lt_y [_] H_y_lt.
+            suff : (y1 + Z.of_N c1 < y1). {
+              apply Z.nlt_ge.
+              apply Z_le_add_r.
+            }
+            omega.
+          }
+        } {
+          tauto.
+        } {
+          done.
+        } {
+          by rewrite interval_list_invariant_cons.
+        }
+      }
+    }
+  Qed.
+
+  Lemma inter_aux2_props :
+   forall (s2 s1 acc : t),
+    interval_list_invariant (rev acc) = true ->
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    (forall x1 x2, InZ x1 acc -> InZ x2 s1 -> InZ x2 s2 -> Z.succ x1 < x2) ->
+    ((forall y, (InZ y (inter_aux2 acc s1 s2) <->
+               (InZ y acc) \/ ((InZ y s1) /\ InZ y s2))) /\
+    (interval_list_invariant (inter_aux2 acc s1 s2) = true)).
+  Proof.
+    induction s2 as [| [y2 c2] s2' IH]. {
+      move => s1 acc.
+      move => H_inv_acc _ _ _.
+      unfold inter_aux2.
+      replace (match s1 with
+        | nil => rev' acc
+        | _ :: _ => rev' acc
+               end) with (rev' acc); last by case s1.
+      rewrite /rev' rev_append_rev app_nil_r.
+      split; last done.
+      move => y.
+      rewrite InZ_nil InZ_rev.
+      tauto.
+    } {
+      intros s1 acc H_inv_acc H_inv_s1.
+      rewrite interval_list_invariant_cons.
+      move => [H_gr_s2'] [H_c2_neq_0] H_inv_s2'.
+      move => H_acc_s12.
+
+      move : H_gr_s2'.
+      rewrite interval_list_elements_greater_alt2_def //.
+      move => H_gr_s2'.
+      
+      rewrite /inter_aux2; fold inter_aux2.
+      case_eq s1. {
+        move => H_s1_eq.
+        split. {
+          move => y.
+          rewrite /rev' rev_append_rev app_nil_r InZ_nil
+                  InZ_rev.
+          tauto.
+        } {
+          rewrite /rev' rev_append_rev app_nil_r //.
+        }
+      } {
+        move => [_ _] _ <-.
+        case_eq (inter_aux y2 c2 acc s1).
+        move => acc' s1' H_inter_aux_eq.
+
+        have H_acc_s1_yc2 : forall x1 x2 : Z,
+          InZ x1 acc ->
+          InZ x2 s1 ->
+          List.In x2 (elementsZ_single y2 c2) ->
+          Z.succ x1 < x2. {
+          intros x1 x2 H_x1_in H_x2_in1 H_x2_in2.
+          apply H_acc_s12 => //.
+          rewrite InZ_cons; by left.
+        }
+
+        move : (inter_aux_props y2 c2 s1 acc H_inv_acc H_inv_s1 H_acc_s1_yc2 H_c2_neq_0).
+        rewrite H_inter_aux_eq.
+        move => [H_in_acc'] [H_in_s1'_elim] [H_in_s1'_intro]
+                [H_inv_acc'] H_inv_s1'.
+
+        have H_in_acc'_s2' : forall x1 x2 : Z,
+            InZ x1 acc' -> InZ x2 s1' -> InZ x2 s2' -> Z.succ x1 < x2. {
+          move => x1 x2 /H_in_acc'.
+          move => []. {
+            move => H_in_acc H_in_s1' H_in_s2'.
+            apply H_acc_s12 => //. {
+              by apply H_in_s1'_elim.
+            } {
+              rewrite InZ_cons; by right.
+            }
+          } {
+            rewrite In_elementsZ_single.
+            move => [H_in_s1] [_] H_x1_lt _.
+            move => /H_gr_s2' H_lt_x2.
+            apply Z.le_lt_trans with (m := y2 + Z.of_N c2) => //.
+            by apply Z.le_succ_l.
+          }
+        }
+       
+        move : (IH s1' acc' H_inv_acc' H_inv_s1' H_inv_s2' H_in_acc'_s2').
+        move => [H_inZ_res] H_inv_res.
+        split; last assumption.
+        move => y.
+        rewrite H_inZ_res H_in_acc' InZ_cons
+                In_elementsZ_single.
+        split. {
+          move => []; first by tauto.
+          move => [H_y_in_s1' H_y_in_s2'].
+          right.
+          split; last by right.
+          by apply H_in_s1'_elim.
+        } {
+          move => []. {
+            move => H_y_in_acc.
+            by left; left.
+          } {
+            move => [H_y_in_s1].
+            move => []. {
+              move => H_in_yc2.
+              by left; right.
+            } {
+              right.
+              split; last assumption.
+              apply H_in_s1'_intro => //.
+              by apply H_gr_s2'.
+            }
+          }
+        }
+      }
+    }
+  Qed.
+ 
+  Lemma inter_InZ :
+   forall (s1 s2 : t),
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    forall y, (InZ y (inter s1 s2) <-> InZ y s1 /\ InZ y s2).
+  Proof.
+    intros s1 s2 H_inv_s1 H_inv_s2 y.
+    rewrite /inter.
+
+    move : (inter_aux2_props s2 s1 nil).
+    move => [] //.
+    move => H_in_inter _.
+    rewrite H_in_inter InZ_nil.
+    tauto.
+  Qed.
+
+  Lemma inter_invariant :
+   forall (s1 s2 : t),
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    interval_list_invariant (inter s1 s2) = true.
+  Proof.
+    intros s1 s2 H_inv_s1 H_inv_s2.
+    rewrite /inter.
+
+    move : (inter_aux2_props s2 s1 nil).
+    move => [] //.
+  Qed.
+  
+ 
+  Global Instance inter_ok s1 s2 : forall `(Ok s1, Ok s2), Ok (inter s1 s2).
+  Proof.
+    move => H_ok_s1 H_ok_s2.
+    move : (H_ok_s1) (H_ok_s2).
+    rewrite /Ok /IsOk /is_encoded_elems_list /add.
+    move => [H_inv_s1] H_pre1.
+    move => [H_inv_s2] H_pre2.
+    split. {
+      apply inter_invariant => //.
+    } {
+      intros y.
+      move : (inter_InZ s1 s2 H_inv_s1 H_inv_s2).    
+      rewrite /InZ => ->.      
+      move => [].
+      move => /H_pre1 //.
+    }
+  Qed.
+
+  Lemma inter_spec :
+   forall (s s' : t) (x : elt) (Hs : Ok s) (Hs' : Ok s'),
+   In x (inter s s') <-> In x s /\ In x s'.
+  Proof.
+    intros s s' x H_ok H_ok'.
+    rewrite !In_InZ.
+    rewrite inter_InZ => //. {
+      apply H_ok.
+    } {
+      apply H_ok'.
+    }
+  Qed.
+
+  
   (** *** filter specification *)
 
   Global Instance filter_ok s f : forall `(Ok s), Ok (filter f s).
@@ -1770,67 +2993,1115 @@ Module Raw (Enc : ElementEncode).
   Qed.
 
 
-  (** *** inter specification *)
-
-  Global Instance inter_ok s s' : forall `(Ok s, Ok s'), Ok (inter s s').
+  (** *** diff specification *)
+ 
+  Lemma diff_aux_alt_def :
+    forall (y2 : Z) (c2 : N) (s : t) acc,
+      diff_aux y2 c2 acc s = match diff_aux y2 c2 nil s with
+                               (acc', s') => (acc' ++ acc, s')
+                             end.
   Proof.
-    intros H_ok H_ok'.
-    rewrite /inter.
-    by apply filter_ok.
+    intros y2 c2.
+    induction s as [| [y1 c1] acc' IH] => acc. {
+      rewrite /diff_aux app_nil_l //.
+    } {
+      simpl.
+      case_eq (diff_aux y2 c2 nil acc') => acc'' s'' H_eq.
+      case (interval_compare (y1, c1) (y2, c2));
+        rewrite ?(IH ((y1, c1)::acc)) ?(IH ((y1, c1)::nil))
+                ?(IH acc) ?(IH ((y1, Z.to_N (y2 - y1)) :: acc))
+                ?(IH ((y1, Z.to_N (y2 - y1)) :: nil)) ?H_eq;
+        rewrite ?insert_intervalZ_guarded_app -?app_assoc -?app_comm_cons //.
+    }
   Qed.
 
-  Lemma inter_spec :
-   forall (s s' : t) (x : elt) (Hs : Ok s) (Hs' : Ok s'),
-   In x (inter s s') <-> In x s /\ In x s'.
+  
+  Lemma diff_aux_props :
+    forall (y2 : Z) (c2 : N) (s : t) acc,
+      interval_list_invariant (List.rev acc) = true ->
+      interval_list_invariant s = true ->
+      (forall x1 x2, InZ x1 acc -> InZ x2 s -> Z.succ x1 < x2) ->
+      (forall x, InZ x acc -> x < y2) ->
+      (c2 <> 0%N) ->
+      match (diff_aux y2 c2 acc s) with
+        (acc', s') => (forall y, InZ y (List.rev_append acc' s') <->
+                                 InZ y (List.rev_append acc s) /\ ~(List.In y (elementsZ_single y2 c2))) /\
+                      (interval_list_invariant (List.rev_append acc' s') = true) /\
+                      (forall x, InZ x acc' -> x < y2 + Z.of_N c2)
+      end.
   Proof.
-    intros s s' x Hs Hs'.
-    rewrite /inter.
-    setoid_rewrite filter_spec. {
-      by rewrite mem_spec.
+    intros y2 c2.     
+    induction s as [| [y1 c1] s1' IH] => acc. {
+      rewrite /diff_aux -rev_alt.       
+      move => H_inv_acc _ _ H_in_acc H_c2_neq.
+      split; last split. {
+        move => y; split; last by move => [] //.
+        rewrite InZ_rev.         
+        move => H_in. split => //.
+        move => /In_elementsZ_single => [] [] /Z.nlt_ge H_neq.
+        contradict H_neq.
+        by apply H_in_acc.
+      } {
+        assumption.
+      } {
+        intros x H_in_acc'.
+        apply Z.lt_le_trans with (m := y2). {
+          by apply H_in_acc.
+        } {
+          by apply Z_le_add_r.
+        }
+      }
     } {
-      repeat red.
-      intros y y' H_y_y'_eq.
-      apply eq_true_iff_eq.
-      rewrite !mem_spec /In.
-      setoid_rewrite H_y_y'_eq.
-      done.
+      rewrite interval_list_invariant_cons.       
+      move => H_inv_acc [H_gr_s1'] [H_c1_neq_0] H_inv_s1'.
+      move => H_in_s1 H_in_acc H_c2_neq_0.
+       
+      rewrite diff_aux_alt_def.
+      case_eq (diff_aux y2 c2 nil ((y1, c1) :: s1')).
+      move => acc' s' H_diff_aux_eq.
+
+      set P1 := forall y : Z,
+        (InZ y acc' \/ InZ y s') <->
+        InZ y ((y1, c1) :: s1') /\ ~ List.In y (elementsZ_single y2 c2).
+      set P2 := interval_list_invariant (rev acc' ++ s') = true.
+      set P3 := forall x : Z, InZ x acc' -> (x < y2 + Z.of_N c2).
+
+      suff : (P1 /\ P2 /\ P3). {
+        move => [H_P1] [H_P2] H_P3.
+        split; last split. {
+          move => y.
+          move : (H_P1 y).
+          rewrite !rev_append_rev rev_app_distr !InZ_app
+                  !InZ_rev In_elementsZ_single.
+          suff : (InZ y acc -> ~ y2 <= y < y2 + Z.of_N c2). {
+            tauto.
+          }
+          move => /H_in_acc H_y_lt [H_y_ge] _.
+          contradict H_y_ge.
+          by apply Zlt_not_le.
+        } {
+          rewrite rev_append_rev rev_app_distr -app_assoc.
+          apply interval_list_invariant_app_intro => //.
+          move => x1 x2.
+          rewrite InZ_app !InZ_rev.
+          move => H_in_acc' H_x2_in_s'.
+          suff : (InZ x2 ((y1, c1)::s1')). {
+            by apply H_in_s1.
+          }
+          move : (H_P1 x2).
+          tauto.
+        } {
+          move => x.
+          rewrite InZ_app.
+          move => []. {
+            apply H_P3.
+          } {
+            move => /H_in_acc H_x_lt.
+            eapply Z.lt_trans; eauto.
+            by apply Z_lt_add_r.
+          }
+        }
+      }
+
+      move : (H_gr_s1').
+      rewrite interval_list_elements_greater_alt2_def => // => H_gr_s1'_alt.
+
+      have : forall (acc : list (Z * N)),
+        interval_list_invariant (rev acc) = true ->
+        (forall x : Z,
+            InZ x acc <->
+            ((y1 <= x < y1 + Z.of_N c1) /\ (x < y2))) ->
+        (y1 + Z.of_N c1 <= y2 + Z.of_N c2) ->
+        (diff_aux y2 c2 acc s1' = (acc', s')) ->
+        P1 /\ P2 /\ P3. {
+        
+        intros acc0 H_inv_acc0 H_in_acc0 H_c1_before H_diff_aux_eq0.
+        have H_in_s1' : (forall x1 x2 : Z,
+                            InZ x1 acc0 -> InZ x2 s1' -> Z.succ x1 < x2). {
+          intros x1 x2 H_x1_in_acc0.
+          move => /H_gr_s1'_alt.
+
+          eapply Z.le_lt_trans.
+          move : H_x1_in_acc0.
+          rewrite Z.le_succ_l H_in_acc0.
+          tauto.
+        }
+        have H_in_acc0' : (forall x : Z, InZ x acc0 -> x < y2). {
+          move => x.
+          rewrite H_in_acc0.
+          move => [_] //.
+        }
+        move : (IH acc0 H_inv_acc0 H_inv_s1' H_in_s1' H_in_acc0' H_c2_neq_0).
+        rewrite H_diff_aux_eq0 !rev_append_rev.
+        move => [H1] [H2] H3.
+        split; last split => //. {
+          move => y.
+          move : (H1 y).
+          rewrite !InZ_app !InZ_rev In_elementsZ_single.
+          move => ->.
+          rewrite InZ_cons In_elementsZ_single.
+          split. {
+            rewrite H_in_acc0 -(Z.nle_gt y2 y).
+            tauto.
+          } {
+            rewrite H_in_acc0 -(Z.nle_gt y2 y).
+            move => [] H_in H_nin_i2.
+            split; last by assumption.
+            move : H_in => [] H_in; last by right.
+            left.
+            omega.
+          }
+        }
+      }
+      move => {IH} IH.
+       
+      clear H_inv_acc H_in_s1 H_in_acc acc.
+      move : (interval_compare_elim y1 c1 y2 c2) H_diff_aux_eq.
+      unfold diff_aux.
+      case_eq (interval_compare (y1, c1) (y2, c2)) => H_comp;
+                                                        fold diff_aux. {
+        move => H_lt_y2.
+        apply IH. {
+          by rewrite interval_list_invariant_sing.
+        } {
+          move => x.
+          rewrite InZ_cons In_elementsZ_single.
+          split; last by tauto.
+          move => []; last done.
+          move => [H_y1_le H_x_lt].         
+          split; first done.       
+          eapply Z.lt_trans; eauto.
+        } {
+          apply Z.le_trans with (m := y2). 
+            - by apply Z.lt_le_incl.
+            - by apply Z_le_add_r.
+        }
+      } {
+        move => H_eq_y2. 
+        apply IH. {
+          by rewrite interval_list_invariant_sing.
+        } {
+          move => x.
+          rewrite InZ_cons In_elementsZ_single -H_eq_y2.
+          split; last by tauto.
+          move => []; last done.
+          move => []. done.
+        } {
+          rewrite H_eq_y2.
+          by apply Z_le_add_r.
+        }
+      } {
+        move => [H_y1_lt_y2] [H_y2_lt_yc1] H_yc1_lt_yc2.
+        apply IH. {
+          rewrite interval_list_invariant_sing.
+          by apply Z_to_N_minus_neq_0.
+        } {
+          move => x.
+          rewrite InZ_cons In_elementsZ_single Z2N.id; last omega.
+          replace (y1 + (y2 - y1)) with y2 by omega.
+          split; last tauto.
+          move => [] //.
+          move => [H_y1_le] H_x_lt.
+          repeat split => //.
+          apply Z.lt_trans with (m := y2) => //.
+        } {
+          by apply Z.lt_le_incl.
+        }
+      } {
+        rewrite /P1 /P2 /P3.
+        move => [H_y2_lt] [H_y1_lt] H_yc1_lt [H_acc'] H_s'.
+        clear IH P1 P2 P3 H_comp.
+        subst.
+        have H_yc1_intro : y2 + Z.of_N c2 + Z.of_N (Z.to_N (y1 + Z.of_N c1 - (y2 + Z.of_N c2))) = y1 + Z.of_N c1. {
+          rewrite Z2N.id; omega.
+        }
+        have H_nin_yc2 : forall y,
+            InZ y s1' -> ~ y2 <= y < y2 + Z.of_N c2. {
+          move => y /H_gr_s1'_alt H_lt_y.
+          move => [H_y2_le_y].
+          apply Z.le_ngt, Z.lt_le_incl.           
+          by apply Z.lt_trans with (m := y1 + Z.of_N c1).
+        }
+        split; last split. {
+          move => y.
+          rewrite !InZ_cons !In_elementsZ_single H_yc1_intro.
+          split. {             
+            move => [] //.
+            move => []. {
+              move => [H_le_y] H_y_lt.
+              split. {
+                left; omega.
+              } {
+                move => [_].
+                by apply Z.nlt_ge.
+              }
+            } {
+              move : (H_nin_yc2 y). tauto.
+            }
+          } {
+            move => [] []; last by right; right.
+            move => [H_y_ge] H_y_lt_yc1 H_nin_yc2'.
+            right; left. omega.
+          }
+        } {
+          rewrite interval_list_invariant_cons H_yc1_intro.
+          split => //.
+          split => //.
+          by apply Z_to_N_minus_neq_0.
+        } {
+          move => [] //.
+        }
+      } {
+        rewrite /P1 /P2 /P3.
+        move => [H_y12_eq] H_c12_eq [] H_acc' H_s'.
+        clear IH P1 P2 P3 H_comp.
+        subst.
+        split; last split. {
+          move => y.
+          rewrite InZ_cons In_elementsZ_single.
+          split; last by tauto. {         
+            move => [] //.
+            move => H_y_in.
+            split; first by right.
+            move => [] _.
+            by apply Z.nlt_ge, Z.lt_le_incl, H_gr_s1'_alt.
+          }
+        } {
+          apply H_inv_s1'.
+        } {
+          move => x [] //.
+        }
+      } {
+        move => [H_y2_le_y1] [H_yc1_le_yc2] _.
+        apply IH. {
+          done.
+        } {
+          move => x.
+          split; first done.
+          omega.
+        } {
+          assumption.
+        }
+      } {
+        rewrite /P1 /P2 /P3.
+        move => [H_y1_le] [H_yc2_le_yc1] _ [] H_acc' H_s'.
+        clear IH P1 P2 P3 H_comp.
+        subst.
+        have H_yc1_intro : y2 + Z.of_N c2 + Z.of_N (Z.to_N (y1 + Z.of_N c1 - (y2 + Z.of_N c2))) = y1 + Z.of_N c1. {
+          rewrite Z2N.id; omega.
+        }       
+        have H_y1_intro : y1 + Z.of_N (Z.to_N (y2 - y1)) = y2. {
+          rewrite Z2N.id; omega.
+        }              
+        split; last split. {
+          move => y.
+          rewrite !InZ_insert_intervalZ_guarded
+                  !InZ_cons !In_elementsZ_single
+                  H_yc1_intro H_y1_intro InZ_nil.
+          split. {
+            rewrite -!or_assoc.
+            move => [[[]|]|] //. {
+              move => [H_y1_le_y] H_y_lt.
+              split. {
+                left.
+                split => //.
+                apply Z.lt_le_trans with (m := y2 + Z.of_N c2) => //.
+                apply Z.lt_trans with (m := y2) => //.
+                by apply Z_lt_add_r.
+              } {
+                move => [] /Z.le_ngt //.
+              }
+            } {
+              move => [H_y2c_le_y] H_y_lt_yc1.
+              split. {
+                left.
+                split => //.
+                apply Z.le_trans with (m := y2 + Z.of_N c2) => //.
+                apply Z.le_trans with (m := y2) => //.
+                apply Z_le_add_r.
+              } {
+                move => [] _ /Z.lt_nge //.
+              }
+            } {
+              move => H_y_in_s1'.
+              split; first by right.
+              suff H_suff : y2 + Z.of_N c2 <= y. {
+                move => [] _ /Z.lt_nge //.
+              }
+              apply Z.le_trans with (m := y1 + Z.of_N c1) => //.
+              apply Z.lt_le_incl.
+              by apply H_gr_s1'_alt.
+            }
+          } {
+            move => [] []; last by tauto.
+            move => [H_y1_le_y] H_y_lt H_neq_y2.
+            apply not_and in H_neq_y2; last by apply Z.le_decidable.          
+            case H_neq_y2. {
+              move => /Z.nle_gt H_y_lt'.
+              left; left; done.
+            } {
+              move => /Z.nlt_ge H_le_y.
+              right; left; done.               
+            }
+          }
+        } {
+          rewrite insert_intervalZ_guarded_rev_nil_app.
+          rewrite !interval_list_invariant_insert_intervalZ_guarded => //. {
+            rewrite H_yc1_intro => //.
+          } {
+            rewrite /insert_intervalZ_guarded.
+            case_eq ((Z.to_N (y1 + Z.of_N c1 - (y2 + Z.of_N c2)) =? 0)%N). {
+              rewrite H_y1_intro.
+              move => /N.eqb_eq /N2Z.inj_iff.
+              rewrite Z2N.id; last first. {
+                by apply Z.le_0_sub.
+              }
+              move => /Zminus_eq H_yc1_eq.
+              eapply interval_list_elements_greater_impl;
+                last apply H_gr_s1'.
+              rewrite H_yc1_eq.
+              apply Z_le_add_r.
+            } {
+              move => _.
+              rewrite interval_list_elements_greater_cons
+                      H_y1_intro.
+              by apply Z_lt_add_r.
+            }
+          }
+        } {
+          move => x.
+          rewrite InZ_insert_intervalZ_guarded InZ_cons In_elementsZ_single H_y1_intro InZ_nil.
+          move => [] //.
+          move => [_] H_x_lt.
+          apply Z.lt_le_trans with (m := y2) => //.
+          apply Z_le_add_r.
+        }
+      } {
+        rewrite /P1 /P2 /P3.
+        move => H_yc2_lt [] H_acc' H_s'.
+        clear IH P1 P2 P3 H_comp.
+        subst.
+        split; last split. {
+          move => y.
+          rewrite InZ_cons In_elementsZ_single.
+          split; last by tauto. {         
+            move => [] //.
+            move => H_y_in.
+            split; first assumption.
+            rewrite In_elementsZ_single.
+            move => [] H_y2_le H_y_lt.
+            case H_y_in; first by omega.
+            move => /H_gr_s1'_alt H_lt_y.
+            suff : y2 + Z.of_N c2 < y. {
+              move => ?. omega.
+            }
+            apply Z.lt_trans with (m := y1 + Z.of_N c1) => //.
+            apply Z.lt_le_trans with (m := y1) => //.
+            apply Z_le_add_r.
+          }
+        } {
+          by rewrite interval_list_invariant_cons.
+        } {
+          done.
+        }
+      } {
+        rewrite /P1 /P2 /P3.
+        move => H_yc2_eq [] H_acc' H_s'.
+        clear IH P1 P2 P3 H_comp.
+        subst.
+        split; last split. {
+          move => y.
+          rewrite InZ_cons In_elementsZ_single.
+          split; last by tauto. {         
+            move => [] //.
+            move => H_y_in.
+            split; first assumption.
+            rewrite In_elementsZ_single.
+            move => [] H_y2_le H_y_lt.
+            case H_y_in; first by omega.
+            move => /H_gr_s1'_alt H_lt_y.
+            suff : y2 + Z.of_N c2 < y. {
+              move => ?. omega.
+            }
+            apply Z.lt_trans with (m := (y2 + Z.of_N c2) + Z.of_N c1) => //. 
+            by apply Z_lt_add_r.
+          }
+        } {
+          by rewrite interval_list_invariant_cons.
+        } {
+          done.
+        }
+      }
     }
   Qed.
 
 
-  (** *** diff specification *)
-
-  Global Instance diff_ok s s' : forall `(Ok s, Ok s'), Ok (diff s s').
+  Lemma diff_aux2_props :
+   forall (s2 s1 acc : t),
+    interval_list_invariant (rev_append acc s1) = true ->
+    interval_list_invariant s2 = true ->
+    (forall x1 x2, InZ x1 acc -> InZ x2 s2 -> Z.succ x1 < x2) ->
+    ((forall y, (InZ y (diff_aux2 acc s1 s2) <->
+               ((InZ y acc) \/ (InZ y s1)) /\ ~InZ y s2)) /\
+    (interval_list_invariant (diff_aux2 acc s1 s2) = true)).
   Proof.
-    intros ? ?.
-    by apply remove_list_ok.
+    induction s2 as [| [y2 c2] s2' IH]. {
+      move => s1 acc H_inv_acc_s1 _ _. 
+      rewrite /diff_aux2.
+      replace (match s1 with
+        | nil => rev_append acc s1
+        | _ :: _ => rev_append acc s1
+       end) with (rev_append acc s1); last by case s1.
+      split. {
+        move => y.
+        rewrite rev_append_rev InZ_app InZ_rev InZ_nil.
+        tauto.
+      } {
+        assumption.
+      }        
+    } {
+      intros s1 acc H_inv_acc_s1.
+      rewrite interval_list_invariant_cons.
+      move => [H_gr_s2'] [H_c2_neq_0] H_inv_s2'.
+      move => H_acc_s2.
+      rewrite /diff_aux2; fold diff_aux2.
+      case_eq s1. {
+        move => H_s1_eq.
+        split. {
+          move => y.
+          rewrite rev_append_rev InZ_app InZ_nil InZ_rev.
+          split; last tauto.
+          move => [] // H_y_in.
+          split; first by left.
+          move => H_y_in'.
+          move : (H_acc_s2 _ _ H_y_in H_y_in').
+          apply Z.nlt_succ_diag_l.
+        } {
+          move : H_inv_acc_s1.
+           by rewrite H_s1_eq.
+        }
+      } {
+        move => [_ _] _ <-.
+        case_eq (diff_aux y2 c2 acc s1).
+        move => acc' s1' H_diff_aux_eq.
+
+        have H_acc_lt_y2 : (forall x : Z, InZ x acc -> x < y2). {
+          move => x H_x_in.
+          have H_y2_in: (InZ y2 ((y2,c2) :: s2')). {
+            rewrite InZ_cons.
+            left.
+            by apply In_elementsZ_single_hd.
+          }
+          move : (H_acc_s2 _ _ H_x_in H_y2_in).
+          apply Z.lt_trans, Z.lt_succ_diag_r.
+        }
+
+        have [H_inv_acc [H_inv_s1 H_acc_s1]] :
+          interval_list_invariant (rev acc) = true /\
+          interval_list_invariant s1 = true /\
+          (forall x1 x2 : Z,
+             InZ x1 acc -> InZ x2 s1 -> Z.succ x1 < x2). {
+
+          move : H_inv_acc_s1.
+          rewrite rev_append_rev.
+          move => /interval_list_invariant_app_elim.
+          move => [?] [?] H_x.
+          split; first assumption.
+          split; first assumption.
+          move => x1 x2 H_in_x1.
+          apply H_x.
+          by rewrite InZ_rev.
+        }
+
+        move : (diff_aux_props y2 c2 s1 acc H_inv_acc H_inv_s1 H_acc_s1 H_acc_lt_y2 H_c2_neq_0).
+        rewrite !H_diff_aux_eq.
+        move => [H_inZ_res] [H_inv_res] H_inZ_acc'.
+
+        have H_acc'_s2' : (forall x1 x2 : Z,
+                              InZ x1 acc' -> InZ x2 s2' -> Z.succ x1 < x2). {
+          move => x1 x2 H_x1_in H_x2_in.
+          apply Z.le_lt_trans with (m := y2 + Z.of_N c2). {
+            apply Z.le_succ_l.
+            by apply H_inZ_acc'.
+          } {
+            move : H_gr_s2'.
+            rewrite interval_list_elements_greater_alt2_def //.
+            move => H_gr_s2'.
+            by apply H_gr_s2'.
+          }
+        }
+
+        move : (IH s1' acc' H_inv_res H_inv_s2' H_acc'_s2').
+        move => [] H_inZ_diff_res ->.
+        split; last done.
+        move => y.
+        rewrite H_inZ_diff_res.
+        move : (H_inZ_res y).
+        rewrite !rev_append_rev !InZ_app !InZ_rev InZ_cons.
+        move => ->.
+        tauto.
+      }
+    }
+  Qed.
+
+
+  Lemma diff_InZ :
+   forall (s1 s2 : t),
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    forall y, (InZ y (diff s1 s2) <-> InZ y s1 /\ ~InZ y s2).
+  Proof.
+    intros s1 s2 H_inv_s1 H_inv_s2 y.
+    rewrite /diff.
+
+    move : (diff_aux2_props s2 s1 nil).
+    move => [] //.
+    move => H_in_diff _.
+    rewrite H_in_diff InZ_nil.
+    tauto.
+  Qed.
+
+  Lemma diff_invariant :
+   forall (s1 s2 : t),
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    interval_list_invariant (diff s1 s2) = true.
+  Proof.
+    intros s1 s2 H_inv_s1 H_inv_s2.
+    rewrite /diff.
+
+    move : (diff_aux2_props s2 s1 nil).
+    move => [] //.
+  Qed.
+  
+ 
+  Global Instance diff_ok s1 s2 : forall `(Ok s1, Ok s2), Ok (diff s1 s2).
+  Proof.
+    move => H_ok_s1 H_ok_s2.
+    move : (H_ok_s1) (H_ok_s2).
+    rewrite /Ok /IsOk /is_encoded_elems_list /add.
+    move => [H_inv_s1] H_pre1.
+    move => [H_inv_s2] H_pre2.
+    split. {
+      apply diff_invariant => //.
+    } {
+      intros y.
+      move : (diff_InZ s1 s2 H_inv_s1 H_inv_s2).    
+      rewrite /InZ => ->.      
+      move => [].
+      move => /H_pre1 //.
+    }
   Qed.
 
   Lemma diff_spec :
    forall (s s' : t) (x : elt) (Hs : Ok s) (Hs' : Ok s'),
    In x (diff s s') <-> In x s /\ ~In x s'.
   Proof.
-    intros s s' x Hs Hs'.
-    rewrite /diff remove_list_spec.
-    tauto.
+    intros s s' x H_ok H_ok'.
+    rewrite !In_InZ.
+    rewrite diff_InZ => //. {
+      apply H_ok.
+    } {
+      apply H_ok'.
+    }
   Qed.
 
 
-  (** *** subset specification *)
+  (** *** remove specification *)
 
+  Lemma removeZ_alt_def : forall x s acc,
+    interval_list_invariant s = true ->  
+    removeZ_aux acc x s = match diff_aux x (1%N) acc s with
+                    (acc', s') => rev_append acc' s'
+                  end.
+  Proof.
+    intros y2.
+    induction s as [| [y1 c1] s' IH]; first done.
+
+    move => acc.
+    rewrite interval_list_invariant_cons /=. 
+    move => [H_gr] [H_c1_neq_0] H_inv_s'.
+    move : (interval_1_compare_elim y2 y1 c1).
+    rewrite interval_1_compare_alt_def.
+    rewrite !(interval_compare_swap y1 c1 y2); last first. {
+      right. done.
+    }
+    move : (interval_compare_elim y1 c1 y2 (1%N)).    
+    case_eq (interval_compare (y1, c1) (y2, (1%N))) => H_eq. {
+      move => H_lt_y2 _.
+      have H_yc2_nlt : ~(y2 < y1 + Z.of_N c1). {
+        by apply Z.nlt_ge, Z.lt_le_incl.
+      }
+      have H_y2_nlt : ~(y2 < y1). {
+        move => H_y2_y1.
+        apply H_yc2_nlt.
+        apply Z.lt_le_trans with (m := y1) => //.
+        apply Z_le_add_r.
+      }
+      move : (H_y2_nlt) (H_yc2_nlt) => /Z.ltb_nlt -> /Z.ltb_nlt ->.
+      rewrite IH //.
+    } {
+      move => H_lt_y2 _.
+      have H_yc2_nlt : ~(y2 < y1 + Z.of_N c1). {
+        apply Z.nlt_ge.
+        rewrite H_lt_y2.
+        apply Z.le_refl.
+      }
+      have H_y2_nlt : ~(y2 < y1). {
+        move => H_y2_y1.
+        apply H_yc2_nlt.
+        apply Z.lt_le_trans with (m := y1) => //.
+        apply Z_le_add_r.
+      }
+      move : (H_y2_nlt) (H_yc2_nlt) => /Z.ltb_nlt -> /Z.ltb_nlt ->.
+      rewrite IH //.
+    } {
+      done.
+    } {
+      done.
+    } {
+      move => [H_y1_eq] H_c1_eq.
+      move => [] // .
+      move => [H_lt_y2] H_y2_lt.
+      have H_y2_nlt : ~(y2 < y1). {
+        apply Z.nlt_ge => //.
+      }
+      move : (H_y2_nlt) (H_y2_lt) => /Z.ltb_nlt -> /Z.ltb_lt ->.
+      rewrite /insert_intervalZ_guarded.
+
+      have -> : (Z.to_N (y1 + Z.of_N c1 - Z.succ y2) =? 0 = true)%N. {
+        rewrite H_y1_eq H_c1_eq Z.add_1_r Z.sub_diag //.
+      }
+
+      have -> : (Z.to_N (y2 - y1) =? 0 = true)%N. {
+        rewrite H_y1_eq Z.sub_diag //.
+      }
+      done.       
+    } {
+      move => [H_y2_le] [H_yc1_le] _.
+      move => [] //.
+      move => [H_y1_le] H_y2_lt.
+      have H_y2_nlt : ~(y2 < y1). {
+        apply Z.nlt_ge => //.
+      }
+      move : (H_y2_nlt) (H_y2_lt) => /Z.ltb_nlt -> /Z.ltb_lt ->.
+
+      have H_y1_eq : (y1 = y2) by omega.
+      have H_yc1_eq : (y1 + Z.of_N c1 = Z.succ y2). {
+        apply Z.le_antisymm. {
+          move : H_yc1_le.
+          rewrite Z.add_1_r //.
+        } {
+          by apply Z.le_succ_l.
+        }
+      }
+
+      rewrite /insert_intervalZ_guarded.
+      have -> : (Z.to_N (y1 + Z.of_N c1 - Z.succ y2) =? 0 = true)%N. {
+        rewrite H_yc1_eq Z.sub_diag //.
+      }
+
+      have -> : (Z.to_N (y2 - y1) =? 0 = true)%N. {
+        rewrite H_y1_eq Z.sub_diag //.
+      }
+
+      suff -> : diff_aux y2 (1%N) acc s' = (acc, s') by done.
+
+      move : H_gr.
+      rewrite H_yc1_eq.
+      case s' as [| [y' c'] s'']. {
+        done.
+      } {
+        rewrite interval_list_elements_greater_cons /=
+                /interval_compare.
+        move => H_lt_y'.
+        have -> : y2 + Z.of_N 1 ?= y' = Lt. {
+          apply Z.compare_lt_iff.
+          by rewrite Z.add_1_r.
+        }
+        done.
+      }
+    } { 
+      move => [H_y1_le] [H_yc2_le] _.
+      move => [] //.
+      move => [_] H_y2_lt.
+      have H_y2_nlt : ~(y2 < y1). {
+        apply Z.nlt_ge => //.
+      }
+      move : (H_y2_nlt) (H_y2_lt) => /Z.ltb_nlt -> /Z.ltb_lt ->.
+      rewrite !rev_append_rev /insert_intervalZ_guarded Z.add_1_r.
+      case ((Z.to_N (y2 - y1) =? 0)%N),  (Z.to_N (y1 + Z.of_N c1 - Z.succ y2) =? 0)%N. {
+        reflexivity.
+      } {
+        rewrite /= -!app_assoc //.
+      } {
+        reflexivity.
+      } {
+        rewrite /= -!app_assoc //.
+      }
+    } {
+      move => _ H_y2_lt'.
+      have H_y2_lt : (y2 < y1). {
+        apply Z.lt_trans with (m := Z.succ y2) => //.
+        apply Z.lt_succ_diag_r.
+      }
+      move : (H_y2_lt) => /Z.ltb_lt -> //.
+    } {
+      move => _ H_y1_eq.
+      have H_y2_lt : (y2 < y1). {
+        rewrite H_y1_eq.
+        apply Z.lt_succ_diag_r.
+      }
+      move : (H_y2_lt) => /Z.ltb_lt -> //.
+    }
+  Qed.
+
+  Lemma removeZ_interval_list_invariant : forall s x, interval_list_invariant s = true -> interval_list_invariant (removeZ x s) = true.
+  Proof.
+    intros s x H_inv.
+    rewrite /removeZ removeZ_alt_def //.
+    move : (diff_aux_props x (1%N) s nil).
+    case_eq (diff_aux x 1%N nil s).
+    move => acc' s' H_eq [] //.
+    move => _ [] //.
+  Qed.
+
+  Lemma removeZ_spec :
+   forall (s : t) (x y : Z) (Hs : interval_list_invariant s = true),
+    InZ y (removeZ x s) <-> InZ y s /\ ~Z.eq y x.
+  Proof.
+    intros s x y H_inv.
+    rewrite /removeZ removeZ_alt_def //.
+    move : (diff_aux_props x (1%N) s nil).
+    case_eq (diff_aux x 1%N nil s).
+    move => acc' s' H_eq [] //.
+    move => -> _.
+    rewrite rev_append_rev InZ_app InZ_rev InZ_nil
+            In_elementsZ_single1.
+    split; move => [H1 H2]; split => //;
+      move => H3; apply H2; by rewrite H3.
+  Qed.
+
+  Global Instance remove_ok s x : forall `(Ok s), Ok (remove x s).
+  Proof.
+    rewrite /Ok /interval_list_invariant /remove.
+    move => [H_is_ok_s H_enc_s].
+    split. {
+      by apply removeZ_interval_list_invariant.
+    } {
+      rewrite /is_encoded_elems_list => y.
+      move : (removeZ_spec s (Enc.encode x) y H_is_ok_s).
+      rewrite /InZ => -> [] H_y_in _.
+      apply H_enc_s => //.
+    }
+  Qed.
+
+  Lemma remove_spec :
+   forall (s : t) (x y : elt) (Hs : Ok s),
+    In y (remove x s) <-> In y s /\ ~Enc.E.eq y x.
+  Proof.
+    intros s x y Hs.
+    have H_rs := (remove_ok s x Hs).
+    rewrite /remove !In_InZ.
+    rewrite removeZ_spec. {
+      rewrite Enc.encode_eq //.
+    } {
+      apply Hs.
+    }
+  Qed.
+  
+
+  (** *** remove_list specification *)
+
+  Lemma remove_list_ok : forall l s, Ok s -> Ok (remove_list l s).
+  Proof.
+    induction l as [| x l' IH]. {
+      done.
+    } {
+      move => s H_s_ok /=.
+      apply IH.
+      by apply remove_ok.
+    }
+  Qed.
+
+  Lemma remove_list_spec : forall x l s, Ok s -> 
+     (In x (remove_list l s) <-> ~(InA Enc.E.eq x l) /\ In x s).
+  Proof.
+    move => x.
+    induction l as [| y l' IH]. {
+      intros s H.
+      rewrite /= InA_nil.
+      tauto.
+    } {
+      move => s H_ok /=.
+      rewrite IH remove_spec InA_cons.
+      tauto.
+    }
+  Qed.
+
+  
+  (** *** subset specification *)
+ 
+  Lemma subset_flatten_alt_def : forall (s1 s2 : t), 
+    subset s1 s2 =
+    match (s1, s2) with
+    | (nil, _) => true
+    | (_ :: _, nil) => false
+    | ((y1, c1) :: l1, (y2, c2) :: l2) =>
+        match (interval_compare (y1, c1) (y2,c2)) with
+          | ICR_before       => false
+          | ICR_before_touch => false
+          | ICR_after        => subset s1 l2 
+          | ICR_after_touch  => false
+          | ICR_overlap_before => false
+          | ICR_overlap_after => false
+          | ICR_equal => subset l1 l2
+          | ICR_subsume_1 => subset l1 s2
+          | ICR_subsume_2 => false
+        end
+    end.
+  Proof.
+    intros s1 s2.    
+    case s1, s2 => //. 
+  Qed.
+
+  Lemma subset_props_aux : forall y1 c1 l1 y2 c2 l2,
+    (exists y, InZ y ((y1, c1) :: l1) /\ ~InZ y ((y2, c2) :: l2)) ->
+    (false = true <->
+    (forall y : Z,
+        InZ y ((y1, c1) :: l1) -> InZ y ((y2, c2) :: l2))).
+  Proof.
+    intros y1 c1 l1 y2 c2 l2.
+    move => [y] [H_y_in H_y_nin].
+    split; first done.
+    move => H.
+    contradict H_y_nin.
+    by apply H.
+  Qed.
+      
+  Lemma subset_props_aux_before : forall y1 c1 l1 y2 c2 l2,
+    (c1 <> 0%N) ->
+    interval_list_invariant ((y2, c2) :: l2) = true ->
+    (y1 < y2) ->
+    (false = true <->
+    (forall y : Z,
+        InZ y ((y1, c1) :: l1) -> InZ y ((y2, c2) :: l2))).
+  Proof.
+    intros y1 c1 l1 y2 c2 l2.
+    rewrite interval_list_invariant_cons.
+    move => H_c1_neq_0 [H_gr] [H_inv_l2] H_c2_neq_0 H_y1_lt.
+    apply subset_props_aux.
+    exists y1.
+    split. {
+      rewrite InZ_cons.
+      left.
+      by apply In_elementsZ_single_hd.
+    } {
+      rewrite InZ_cons.
+      suff : ~ (List.In y1 (elementsZ_single y2 c2)) /\ ~ InZ y1 l2 by tauto.
+      split. {
+        rewrite In_elementsZ_single.
+        move => [] /Z.le_ngt //.
+      } {
+        eapply Nin_elements_greater; eauto.
+        apply Z.le_trans with (m := y2). {
+          by apply Z.lt_le_incl.
+        } {
+          apply Z_le_add_r.
+        }
+      }
+    }
+  Qed.
+
+  
+  Lemma subset_props : forall s1 s2 : t,
+    interval_list_invariant s1 = true ->
+    interval_list_invariant s2 = true ->
+    (subset s1 s2 = true <->
+     (forall y, InZ y s1 -> InZ y s2)).
+  Proof.
+    induction s1 as [| [y1 c1] l1 IH1]. {
+      move => s2 _ _.
+      rewrite subset_flatten_alt_def.
+      split; done.
+    } {
+      induction s2 as [| [y2 c2] l2 IH2]. {
+        rewrite interval_list_invariant_cons
+                subset_flatten_alt_def.
+        move => [_] [H_c1_neq_0] _ _.        
+        split => //.
+        move => H; move : (H y1).
+        rewrite InZ_nil => {H} H.
+        contradict H.
+        rewrite InZ_cons; left.
+        by apply In_elementsZ_single_hd.
+      } {
+        move => H_inv_s1 H_inv_s2.
+        move : (H_inv_s1) (H_inv_s2).
+        rewrite !interval_list_invariant_cons.
+        move => [H_gr_l1] [H_c1_neq_0] H_inv_l1.
+        move => [H_gr_l2] [H_c2_neq_0] H_inv_l2.
+        move : (IH2 H_inv_s1 H_inv_l2) => {IH2} IH2.
+        have :  forall s2 : t,
+          interval_list_invariant s2 = true ->
+          (subset l1 s2 = true <->
+          (forall y : Z, InZ y l1 -> InZ y s2)). {
+          intros. by apply IH1.
+        }
+        move => {IH1} IH1.
+
+        have H_yc2_nin : ~ InZ (y2 + Z.of_N c2) ((y2, c2) :: l2). {
+          rewrite !InZ_cons !In_elementsZ_single.
+          move => []. {
+            move => [_] /Z.lt_irrefl //.
+          } {
+            eapply Nin_elements_greater; eauto.
+            apply Z.le_refl.
+          }
+        }
+          
+        rewrite subset_flatten_alt_def.
+        move : (interval_compare_elim y1 c1 y2 c2).
+        case (interval_compare (y1, c1) (y2, c2)). {
+          move => H_lt_y2.
+          apply subset_props_aux_before => //.
+          apply Z.le_lt_trans with (m := y1 + Z.of_N c1) => //.
+          apply Z_le_add_r.          
+        } {
+          move => H_y2_eq.
+          apply subset_props_aux_before => //.
+          rewrite -H_y2_eq.
+          by apply Z_lt_add_r.
+        } {
+          move => [H_y1_lt] _.
+          apply subset_props_aux_before => //.
+        } {
+          move => [H_y2_lt] [H_y1_lt] H_yc2_lt.          
+          apply subset_props_aux.
+          exists (y2 + Z.of_N c2).
+          split => //.
+          rewrite !InZ_cons !In_elementsZ_single.
+          left.
+          split => //.
+          by apply Z.lt_le_incl.
+        } {
+          move => [H_y1_eq] H_c1_eq; subst.
+          rewrite IH1 => //.
+          split; move => H_pre y; move : (H_pre y) => {H_pre};
+            rewrite !InZ_cons. {
+            tauto.
+          } {
+            move => H_pre H_y_in_l1.
+            suff : ~(List.In y (elementsZ_single y2 c2)). {
+              tauto.
+            }
+            move : H_gr_l1.
+            rewrite interval_list_elements_greater_alt2_def
+              // In_elementsZ_single.
+            move => H; move : (H y H_y_in_l1) => {H}.
+            move => /Z.lt_ngt H_neq [_] //.
+          }
+        } {
+          move => [H_y2_lt_y1] [H_yc1_le] _.
+          rewrite IH1.
+          split; move => H_pre y; move : (H_pre y) => {H_pre};
+            rewrite !InZ_cons. {
+            move => H []; last apply H. move => {H}.
+            rewrite !In_elementsZ_single.
+            move => [H_y1_le] H_y_lt.
+            left.
+            omega.
+          } {
+            move => H_pre H_y_in_l1.
+            apply H_pre.
+            by right.
+          } {
+            assumption.
+          }
+        } {
+          move => [H_y1_le] [_] []. {
+            apply subset_props_aux_before => //.
+          } {
+            move => H_yc2_lt.
+            apply subset_props_aux.
+            exists (y2 + Z.of_N c2).
+            split => //.
+            rewrite !InZ_cons !In_elementsZ_single.
+            left.
+            split => //.
+            apply Z.le_trans with (m := y2) => //.
+            apply Z_le_add_r.
+          }
+        } {
+          move => H_yc2_lt_y1.
+          rewrite IH2.
+          split; move => H_pre y; move : (H_pre y) => {H_pre};
+                                                        rewrite !InZ_cons. {
+            tauto.
+          } {
+            rewrite !In_elementsZ_single.
+            move => H_pre H_y_in.
+            suff : ~(y2 <= y < y2 + Z.of_N c2). {
+              tauto.
+            }
+            move => [H_y2_le H_y_lt].
+            move : H_y_in => []. {
+              move => [H_y1_le] H_y_lt'.
+              omega.
+            } {
+              eapply Nin_elements_greater; eauto.
+              apply Z.le_trans with (m := y1); last first. {
+                apply Z_le_add_r.
+              }
+              apply Z.lt_le_incl.
+              apply Z.lt_trans with (m := y2 + Z.of_N c2) => //.
+            }
+          }
+        } {
+          move => H_y1_eq.
+          apply subset_props_aux.
+          exists y1.
+          rewrite !InZ_cons.
+          split. {
+            left.
+            by apply In_elementsZ_single_hd.
+          } {
+            rewrite !In_elementsZ_single H_y1_eq. 
+            move => []. {
+              move => [_] /Z.lt_irrefl //.
+            } {
+              eapply Nin_elements_greater; eauto.
+              rewrite H_y1_eq.
+              apply Z.le_refl.
+            }
+          }
+        }
+      }
+    }
+  Qed. 
+     
   Lemma subset_spec :
    forall (s s' : t) (Hs : Ok s) (Hs' : Ok s'),
    subset s s' = true <-> Subset s s'.
   Proof.
     intros s s' Hs Hs'.
-    rewrite /subset forallb_forall /Subset.
-    split; (
-      move => H x /In_alt_def H_x_in;
-      move : (H x H_x_in) => {H};
-      rewrite mem_spec //
-    ).
+    move : (Hs) (Hs').
+    rewrite /Ok /IsOk.
+    move => [H_inv_s H_enc_s] [H_inv_s' H_enc_s'].
+    rewrite (subset_props s s' H_inv_s H_inv_s').
+    rewrite /Subset.
+    split. {
+      move => H_pre enc_y.
+      rewrite !In_InZ.
+      apply H_pre.
+    } {
+      move => H_pre y H_y_in.
+      move : (H_enc_s _ H_y_in) => [e] H_e. subst.
+      move : (H_pre e) H_y_in.
+      rewrite !In_InZ //.
+    }
   Qed.
-
+  
 
   (** *** elements and elementsZ specification *)
 
@@ -1879,7 +4150,7 @@ Module Raw (Enc : ElementEncode).
       apply NoDupA_nil.
     } {
       move => H_ok_s.
-      move : (H_ok_s) => /Ok_cons [H_inf] [H_c] [H_enc] H_s'.
+      move : (H_ok_s) => /Ok_cons [H_interval_list_elements_greater] [H_c] [H_enc] H_s'.
       rewrite elementsZ_cons.
       apply NoDupA_app. {
         apply Z.eq_equiv.
@@ -1899,8 +4170,13 @@ Module Raw (Enc : ElementEncode).
         move : H_y_in'.
         rewrite -in_rev In_elementsZ_single /=.
         move => [H_x_le] H_y_lt.
-        eapply Nin_elements_greater; eauto; first apply H_s'.
-        by apply Z.lt_le_incl.
+        eapply (Nin_elements_greater s' (x + Z.of_N c)) => //. {
+          apply H_s'.
+        } {
+          apply Z.lt_le_incl, H_y_lt.
+        } {
+          apply H_y_in.
+        }
       }
     }
   Qed.
@@ -1947,134 +4223,93 @@ Module Raw (Enc : ElementEncode).
   Qed.
 
   Lemma elementsZ_cons_le_start : forall x cx xs y cy ys,
-     isok ((x, cx) :: xs) = true ->
-     isok ((y, cy) :: ys) = true ->
-     (forall z, List.In z (elementsZ ((y, cy) :: ys)) ->
-                List.In z (elementsZ ((x, cx) :: xs))) ->
+     interval_list_invariant ((x, cx) :: xs) = true ->
+     interval_list_invariant ((y, cy) :: ys) = true ->
+     (forall z, InZ z ((y, cy) :: ys) ->
+                InZ z ((x, cx) :: xs)) ->
      (x <= y). 
   Proof.
     intros x cx xs y cy ys.
-    rewrite !isok_cons.
-    move => [H_inf_xs] [H_cx] H_xs [H_inf_ys] [H_cy] H_ys H.
+    rewrite !interval_list_invariant_cons.
+    move => [H_interval_list_elements_greater_xs] [H_cx] H_xs [H_interval_list_elements_greater_ys] [H_cy] H_ys H_impl.
+    have H_lt_xs : (forall zz : Z, InZ zz xs -> (x + Z.of_N cx) < zz). {
+      apply interval_list_elements_greater_alt2_def => //.
+    }
 
-    case_eq (x <=? y). {
-      move => /Z.leb_le //.
+    move : (Z.lt_ge_cases y x) => [] // H_y_lt.
+    apply Z.le_trans with (m := x + Z.of_N cx). {
+      apply Z_le_add_r.
     } {
-      move => /Z.leb_gt H_y_lt.
+      apply Z.lt_le_incl, H_lt_xs.
+      have H_pre : InZ y ((y, cy) :: ys). {
+        rewrite InZ_cons.
+        left.
+        by apply In_elementsZ_single_hd. 
+      }
+      move : (H_impl y H_pre).
+      rewrite InZ_cons => [] [] //.
+      rewrite In_elementsZ_single.
+      move => [H_x_le].
       exfalso.
-      move : (H y).
-      have -> : (List.In y (elementsZ ((x, cx) :: xs)) <-> False). {
-        split => //.
-        rewrite elementsZ_cons in_app_iff -in_rev In_elementsZ_single.
-        move => []. {
-          suff : (~ InZ y xs). {
-            rewrite /InZ //.
-          }
-          eapply Nin_elements_greater; eauto.
-          eapply Z.le_trans with (m := x). {
-            by apply Z.lt_le_incl.
-          } {
-            apply Z_le_add_r.
-          }
-        } {
-          apply Z.lt_nge in H_y_lt.
-          tauto.
-        }
-      } 
-      have -> : (List.In y (elementsZ ((y, cy) :: ys)) <-> True). {
-        split => // _.
-        rewrite elementsZ_cons in_app_iff -in_rev.
-        right.
-        apply In_elementsZ_single_hd => //.
-      } 
-      tauto.
+      eapply Z.nlt_ge; first apply H_x_le.
+      done.
     }
   Qed.
 
   Lemma elementsZ_cons_le_end : forall x cx xs y cy ys,
-     isok ((x, cx) :: xs) = true ->
-     isok ((y, cy) :: ys) = true ->
+     interval_list_invariant ((x, cx) :: xs) = true ->
+     interval_list_invariant ((y, cy) :: ys) = true ->
      (x <= y + Z.of_N cy) ->
-     (forall z, List.In z (elementsZ ((x, cx) :: xs)) ->
-                List.In z (elementsZ ((y, cy) :: ys))) ->
+     (forall z, InZ z ((x, cx) :: xs) ->
+                InZ z ((y, cy) :: ys)) ->
      (x + Z.of_N cx <= y + Z.of_N cy). 
   Proof.
     intros x cx xs y cy ys.
-    rewrite !isok_cons.
-    move => [H_inf_xs] [H_cx] H_xs [H_inf_ys] [H_cy] H_ys H_x_le H.
+    rewrite !interval_list_invariant_cons.
+    move => [H_interval_list_elements_greater_xs] [H_cx] H_xs [H_interval_list_elements_greater_ys] [H_cy] H_ys H_x_le H_impl.
 
-    case_eq (x + Z.of_N cx <=? y + Z.of_N cy). {
-      move => /Z.leb_le //.
-    } {
-      move => /Z.leb_gt H_y_lt.
-      exfalso.
-      move : (H (y + Z.of_N cy)).
-      have -> : ((List.In (y + Z.of_N cy)) (elementsZ ((y, cy) :: ys)) <-> False). {
-        split => //.
-        rewrite elementsZ_cons in_app_iff -in_rev In_elementsZ_single.
-        move => []. {
-          suff : (~ InZ (y + Z.of_N cy) ys). {
-            rewrite /InZ //.
-          }
-          eapply Nin_elements_greater; eauto.
-          apply Z.le_refl.
-        } {
-          move => [_] /Z.lt_irrefl //.
-        }
-      } 
-      have -> : (List.In (y + Z.of_N cy) (elementsZ ((x, cx) :: xs)) <-> True). {
-        split => // _.
-        rewrite elementsZ_cons in_app_iff -in_rev.
-        right.
-        rewrite In_elementsZ_single => //.
-      } 
-      tauto.
+    apply Z.nlt_ge => H_y_lt.
+
+    have H_nin : ~(InZ (y + Z.of_N cy) ((y, cy) :: ys)). {
+      rewrite InZ_cons In_elementsZ_single.
+      move => []. {
+        move => [_].
+        apply Z.lt_irrefl.
+      } {
+        eapply (Nin_elements_greater ys (y + Z.of_N cy)) => //.
+        apply Z.le_refl.
+      }
     }
+    apply H_nin, H_impl => {H_nin}.
+    
+    rewrite InZ_cons In_elementsZ_single.
+    by left.
   Qed.
 
 
   Lemma elementsZ_cons_equiv_hd : forall x cx xs y cy ys,
-     isok ((x, cx) :: xs) = true ->
-     isok ((y, cy) :: ys) = true ->
-     (forall z, List.In z (elementsZ ((x, cx) :: xs)) <->
-                List.In z (elementsZ ((y, cy) :: ys))) ->
+     interval_list_invariant ((x, cx) :: xs) = true ->
+     interval_list_invariant ((y, cy) :: ys) = true ->
+     (forall z, InZ z ((x, cx) :: xs) <->
+                InZ z ((y, cy) :: ys)) ->
      (x = y) /\ (cx = cy). 
   Proof.
-    intros x cx xs y cy ys H_ok_xs H_ok_ys H.
+    intros x cx xs y cy ys H_ok_xs H_ok_ys H_equiv.
     have H_xy_eq : x = y. {
-      have H_x_le : (x <= y). {
-        eapply (elementsZ_cons_le_start); eauto.
-        intro z.
-        rewrite H => //.
-      } 
-      have H_y_le : (y <= x). {
-        eapply (elementsZ_cons_le_start); eauto.
-        intro z.
-        rewrite H => //.
-      } 
-      apply Z.le_antisymm => //.
+      apply Z.le_antisymm; (
+        eapply (elementsZ_cons_le_start); eauto;
+        apply H_equiv
+      ).
     }
-    subst.
-    split => //.
+    subst. split => //.
 
     have : (y + Z.of_N cx = y + Z.of_N cy). {
-      have H_cx_le : (y + Z.of_N cx <= y + Z.of_N cy). {
-        eapply elementsZ_cons_le_end; eauto. {       
-          apply Z_le_add_r.
-        } {
-          intro Z.
-          rewrite H => //.
-        }
-      }
-      have H_cy_le : (y + Z.of_N cy <= y + Z.of_N cx). {
-        eapply elementsZ_cons_le_end; eauto. {       
-          apply Z_le_add_r.
-        } {
-          intro Z.
-          rewrite H => //.
-        }
-      }
-      apply Z.le_antisymm => //.
+      apply Z.le_antisymm; (
+        eapply elementsZ_cons_le_end; eauto; [
+          apply Z_le_add_r |
+          apply H_equiv
+        ]
+      ).
     }
     rewrite Z.add_cancel_l.
     apply N2Z.inj.
@@ -2090,13 +4325,13 @@ Module Raw (Enc : ElementEncode).
   Proof.
     intros x cx y cy H_cx H_cy H.
     apply elementsZ_cons_equiv_hd with (xs := nil) (ys := nil). {
-      rewrite isok_cons //.
+      rewrite interval_list_invariant_cons //.
     } {
-      rewrite isok_cons //.
+      rewrite interval_list_invariant_cons //.
     } {
       intro z. 
       move : (H z) => {H}.
-      rewrite !elementsZ_cons !in_app_iff !elementsZ_nil -!in_rev /= => -> //.
+      rewrite !InZ_cons => -> //.
     }
   Qed.
    
@@ -2126,14 +4361,14 @@ Module Raw (Enc : ElementEncode).
         rewrite /InZ.
         move => H_in.
 
-        have [H_ok_xs H_inf_xs] : Ok xs /\ inf (x + Z.of_N cx) xs = true. {
+        have [H_ok_xs H_interval_list_elements_greater_xs] : Ok xs /\ interval_list_elements_greater (x + Z.of_N cx) xs = true. {
           move : H_ok_xxs => /Ok_cons; tauto.
         }
-        have [H_ok_ys H_inf_ys] : Ok ys /\ inf (y + Z.of_N cy) ys = true. {
+        have [H_ok_ys H_interval_list_elements_greater_ys] : Ok ys /\ interval_list_elements_greater (y + Z.of_N cy) ys = true. {
           move : H_ok_yys => /Ok_cons. tauto.
         }
-        have H_isok_xs : isok xs=true by apply H_ok_xs.
-        have H_isok_ys : isok ys=true by apply H_ok_ys.
+        have H_isok_xs : interval_list_invariant xs=true by apply H_ok_xs.
+        have H_isok_ys : interval_list_invariant ys=true by apply H_ok_ys.
 
         have [H_x_eq H_cx_eq] : (x = y) /\ (cx = cy). {
           eapply elementsZ_cons_equiv_hd. 
@@ -2148,8 +4383,8 @@ Module Raw (Enc : ElementEncode).
 
         move => z.
         move : (H_in z) => {H_in}.
-        move : (Nin_elements_greater _ _ H_inf_xs H_isok_xs z).
-        move : (Nin_elements_greater _ _ H_inf_ys H_isok_ys z).
+        move : (Nin_elements_greater _ _ H_interval_list_elements_greater_xs H_isok_xs z).
+        move : (Nin_elements_greater _ _ H_interval_list_elements_greater_ys H_isok_ys z).
         rewrite /InZ !elementsZ_cons !in_app_iff -!in_rev !In_elementsZ_single.
         move => H_nin_ys H_nin_xs H_equiv.
         split. {
@@ -2218,39 +4453,52 @@ Module Raw (Enc : ElementEncode).
 
   (** *** choose specification *)
 
-  Lemma choose_alt_def : forall s, 
-    choose s = match chooseZ s with
-      | None => None
-      | Some e => Some (Enc.decode e)
-    end.
-  Proof.
+  Definition chooseZ_spec1 :
+    forall (s : t) (x : Z),
+      interval_list_invariant s = true ->
+      chooseZ s = Some x -> InZ x s. 
+  Proof.   
+    intros s x.
+    case s as [| [x' c] s']. {
+      rewrite /chooseZ //.
+    } {
+      rewrite /chooseZ InZ_cons interval_list_invariant_cons.
+      move => [_] [H_c_neq] _ [->].
+      left.
+      by apply In_elementsZ_single_hd.
+    }
+  Qed.
+
+  Definition chooseZ_spec2 :
+    forall (s : t),
+      chooseZ s = None -> forall x, ~InZ x s. 
+  Proof.   
     intros s.
-    rewrite /choose /chooseZ /elements /rev' rev_append_rev app_nil_r 
-            rev_map_alt_def -map_rev.
-    case (rev (elementsZ s)) => //.
+    case s as [| [x' c] s'];
+      rewrite /chooseZ //.
+    move => _ x //.
   Qed.
 
   Definition choose_spec1 :
-    forall (s : t) (x : elt), choose s = Some x -> In x s. 
+    forall (s : t) (x : elt) (Hs : Ok s), choose s = Some x -> In x s. 
   Proof.   
-    intros s x.
-    rewrite /choose /In.
-    case (elements s) => //.
-    move => z l [<-].
-    apply InA_cons_hd.
-    apply Enc.E.eq_equiv.
+    rewrite /choose.
+    move => s x H_ok.
+    case_eq (chooseZ s) => //.
+    move => z H_choose [<-].
+    apply InZ_In => //.
+    apply chooseZ_spec1 => //.
+    apply H_ok.
   Qed.
 
   Definition choose_spec2 :
     forall s : t, choose s = None -> Empty s.
   Proof.   
-    rewrite /choose /Empty /In.
-    intro s.
-    case (elements s) => //.
-    move => _ a.
-    rewrite InA_nil //.
+    rewrite /choose /chooseZ /Empty /In.
+    case s as [| [x' c] s'] => //.
+    move => _ e.
+    rewrite elements_nil InA_nil //.
   Qed.
-
 
   Lemma chooseZ_min :
     forall (s : t) (x y : Z) (Hs : Ok s),
@@ -2260,31 +4508,15 @@ Module Raw (Enc : ElementEncode).
     eapply (Nin_elements_greater s (Z.pred x)) => //; last apply H_in. {
       move : H_ok H_min.
       case s => //.
-      move => [z c] s'.
-      rewrite /chooseZ Ok_cons elementsZ_cons /rev' -rev_alt rev_app_distr
-              rev_involutive.
-      move => [_] [/N.neq_0_r] [c'] -> _.
-      rewrite elementsZ_single_succ_front /=. 
-      move => [->].
-      apply Z.ltb_lt, Z.lt_pred_l.
+      move => [z c] s' _ [<-].
+      rewrite interval_list_elements_greater_cons.
+      apply Z.lt_pred_l.
     } {
       apply H_ok.
     } {
       by apply Z.lt_le_pred.
     }
   Qed.
-
-  Lemma chooseZ_InZ :
-    forall (s : t) (x : Z),
-    chooseZ s = Some x -> InZ x s.
-  Proof.   
-    intros s x.
-    rewrite /chooseZ /InZ /rev' -rev_alt in_rev.
-    case (rev (elementsZ s)) => //.
-    move => z l [<-] /=.
-    by left.
-  Qed.
-
 
   Lemma chooseZ_spec3: forall s s' x x', Ok s -> Ok s' ->
    chooseZ s = Some x -> chooseZ s' = Some x' -> Equal s s' -> x = x'.
@@ -2294,6 +4526,7 @@ Module Raw (Enc : ElementEncode).
     move : Hx Hx'.
     rewrite H_s_eq => -> [] //.
   Qed.
+
 
   (** *** fold specification *)
 
@@ -2522,7 +4755,7 @@ Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
   Lemma elements_spec2w : NoDupA E.eq (elements s).
   Proof. exact (Raw.elements_spec2w _ _). Qed.
   Lemma choose_spec1 : choose s = Some x -> In x s.
-  Proof. exact (Raw.choose_spec1 _ _). Qed.
+  Proof. exact (Raw.choose_spec1 _ _ _). Qed.
   Lemma choose_spec2 : choose s = None -> Empty s.
   Proof. exact (Raw.choose_spec2 _). Qed.
 
@@ -2606,4 +4839,6 @@ Module ElementEncodeNat <: ElementEncode.
 End ElementEncodeNat.
 
 Module MSetIntervalsNat <: WSetsOn NPeano.Nat := MSetIntervals ElementEncodeNat.
+
+
 
