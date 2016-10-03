@@ -23,12 +23,14 @@
  *
  * 25-09-2016 Thomas Tuerk <thomas@tuerk-brechen.de>
  *   implement union, inter, diff, subset, choose efficiently
+ * 03-10-2016 Thomas Tuerk <thomas@tuerk-brechen.de>
+ *   implement fold, exists_, for_all, filter, partition efficiently
  *)
 
 (** * Weak sets implemented by interval lists 
 
-    This file contains an implementation of the weak set interface
-    [WSetsOn] which uses internally intervals of Z. This allows some
+    This file contains an implementation of the set interface
+    [SetsOn] which uses internally intervals of Z. This allows some
     large sets, which naturally map to intervals of integers to be
     represented very efficiently.
 
@@ -186,7 +188,7 @@ Qed.
     provides encode and decode function. *)
 
 Module Type ElementEncode.
-  Declare Module E : DecidableType.
+  Declare Module E : OrderedType.
 
   Parameter encode : E.t -> Z.
   Parameter decode : Z -> E.t.
@@ -202,6 +204,10 @@ Module Type ElementEncode.
   Axiom encode_eq : forall (e1 e2 : E.t),
     (Z.eq (encode e1) (encode e2)) <-> E.eq e1 e2.
 
+  (** Encoding is compatible with the order of elements. *)
+  Axiom encode_lt : forall (e1 e2 : E.t),
+    (Z.lt (encode e1) (encode e2)) <-> E.lt e1 e2.
+                                      
 End ElementEncode.
 
 
@@ -226,7 +232,7 @@ End ElementEncode.
     the decode function when checking it. This allows for sets with other element types
     than Z.
  *)
-Module Ops (Enc : ElementEncode) <: WOps Enc.E.
+Module Ops (Enc : ElementEncode) <: Ops Enc.E.
   Definition elt := Enc.E.t.
   Definition t := list (Z * N).
 
@@ -245,29 +251,34 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
     apply N.lt_pred_l.
     discriminate.
   Defined.
-
-  Fixpoint elementsZ_aux'' (acc : list Z) (x : Z) (c : N) (H : Acc N.lt c) { struct H } : list Z :=
-    match c as c0 return c = c0 -> list Z with
-    | N0 => fun _ => acc
-    | c => fun Heq => elementsZ_aux'' (x::acc) (Z.succ x) (N.pred c) (acc_pred _ _ Heq H)
+ 
+  Fixpoint fold_elementsZ_aux {A} (f : A -> Z -> option A) (acc : A) (x : Z) (c : N) (H : Acc N.lt c) { struct H } : (bool * A) :=
+    match c as c0 return c = c0 -> (bool * A) with
+    | N0 => fun _ => (false, acc)
+    | c => fun Heq => match (f acc x) with
+        | None => (true, acc)
+        | Some acc' =>             
+          fold_elementsZ_aux f acc' (Z.succ x) (N.pred c) (acc_pred _ _ Heq H) end
     end (refl_equal _).
 
-  Definition elementsZ_aux' acc x c := elementsZ_aux'' acc x c (lt_wf_0 _).
+  Definition fold_elementsZ_single {A} f (acc : A) x c := fold_elementsZ_aux f acc x c (lt_wf_0 _).
 
-  Fixpoint elementsZ_aux acc (s : t) : list Z := 
+  Fixpoint fold_elementsZ {A} f (acc : A) (s : t) : (bool * A) := 
     match s with 
-    | nil => acc
-    | (x, c) :: s' => 
-        elementsZ_aux (elementsZ_aux' acc x c) s'
+    | nil => (false, acc)
+    | (x, c) :: s' =>
+      match fold_elementsZ_single f acc x c with
+          (false, acc') => fold_elementsZ f acc' s'
+        | (true, acc') => (true, acc')
+      end
     end.
 
   Definition elementsZ (s : t) : list Z := 
-    elementsZ_aux nil s.
+    snd (fold_elementsZ (fun l x => Some (x :: l)) nil s).
 
   Definition elements (s : t) : list elt := 
     rev_map Enc.decode (elementsZ s).   
-
-
+  
   (** membership is easily defined *)
   Fixpoint memZ (x : Z) (s : t) :=
     match s with
@@ -330,6 +341,23 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
       end
     end.
 
+  Fixpoint compare (s1 s2 : t) :=
+    match (s1, s2) with
+      | (nil, nil) => Eq
+      | (nil, _ :: _) => Lt
+      | (_ :: _, nil) => Gt
+      | ((y1, c1)::s1', (y2, c2)::s2') =>
+        match (Z.compare y1 y2) with
+          | Lt => Lt
+          | Gt => Gt
+          | Eq => match N.compare c1 c2 with
+                    | Lt => Lt
+                    | Gt => Gt
+                    | Eq => compare s1' s2'
+                  end
+        end
+    end.
+  
   (** Auxiliary functions for inserting at front and merging intervals *)
   Definition merge_interval_size (x1 : Z) (c1 : N) (x2 : Z) (c2 : N) : N :=
     (N.max c1 (Z.to_N (x2 + Z.of_N c2 - x1))).
@@ -363,8 +391,8 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
   Definition addZ x s := addZ_aux nil x s.
   Definition add x s := addZ (Enc.encode x) s.
 
-  (** [add_list] simple extension to add many elements, which then allows to
-      define from_elements. *)
+  (** [add_list] is a simple extension to add many elements.
+      This is used to define the function [from_elements]. *)
   Definition add_list (l : list elt) (s : t) : t :=
      List.fold_left (fun s x => add x s) l s.
 
@@ -517,23 +545,104 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
 
   Definition inter s1 s2 := inter_aux2 nil s1 s2.
 
+
+  (** Partition and filter *)
+
+  Definition partitionZ_fold_insert
+             (cur : option (Z * N)) (x : Z) :=
+    match cur with
+       None => (x, 1%N)
+     | Some (y, c) => (y, N.succ c)
+    end.
+
+  Definition partitionZ_fold_skip (acc : list (Z * N))
+             (cur : option (Z * N)) : (list (Z * N)) :=
+    match cur with
+       None => acc
+     | Some yc => yc::acc
+    end.
+  
+  Definition partitionZ_fold_fun f st (x : Z) :=
+    match st with ((acc_t, c_t), (acc_f, c_f)) =>
+      if (f x) then
+        ((acc_t, Some (partitionZ_fold_insert c_t x)),
+         (partitionZ_fold_skip acc_f c_f, None))
+      else
+        ((partitionZ_fold_skip acc_t c_t, None),
+         (acc_f, Some (partitionZ_fold_insert c_f x)))
+    end.
+  
+  Definition partitionZ_single_aux f st (x : Z) (c : N) :=
+    snd (fold_elementsZ_single (fun st x => Some (partitionZ_fold_fun f st x)) st x c).
+
+  Definition partitionZ_single f acc_t acc_f x c :=
+    match partitionZ_single_aux f ((acc_t, None), (acc_f, None)) x c with
+    | ((acc_t, c_t), (acc_f, c_f)) =>
+        (partitionZ_fold_skip acc_t c_t,
+         partitionZ_fold_skip acc_f c_f)
+    end.
+
+  Fixpoint partitionZ_aux acc_t acc_f f s :=
+    match s with
+    | nil => (List.rev acc_t, List.rev acc_f)
+    | (y, c) :: s' =>
+      match partitionZ_single f acc_t acc_f y c with
+      | (acc_t', acc_f') => partitionZ_aux acc_t' acc_f' f s'
+      end
+    end.
+
+  Definition partitionZ := partitionZ_aux nil nil.
+
+  Definition partition (f : elt -> bool) : t -> (t * t) :=
+    partitionZ (fun z => f (Enc.decode z)).
+
+
+  Definition filterZ_fold_fun f st (x : Z) :=
+    match st with (acc_t, c_t) =>
+      if (f x) then
+        (acc_t, Some (partitionZ_fold_insert c_t x))
+      else
+        (partitionZ_fold_skip acc_t c_t, None)
+    end.
+  
+  Definition filterZ_single_aux f st (x : Z) (c : N) :=
+    snd (fold_elementsZ_single (fun st x => Some (filterZ_fold_fun f st x)) st x c).
+
+  Definition filterZ_single f acc x c :=
+    match filterZ_single_aux f (acc, None) x c with
+    | (acc, c) =>
+        (partitionZ_fold_skip acc c)
+    end.
+
+  Fixpoint filterZ_aux acc f s :=
+    match s with
+    | nil => (List.rev acc)
+    | (y, c) :: s' =>
+      filterZ_aux (filterZ_single f acc y c) f s'
+    end.
+  
+  Definition filterZ := filterZ_aux nil.
+
+  Definition filter (f : elt -> bool) : t -> t :=
+    filterZ (fun z => f (Enc.decode z)).
+
   
   (** Simple wrappers *)
 
-  Definition filter (f : elt -> bool) (s : t) : t :=
-    from_elements (List.filter f (elements s)).
-
   Definition fold {B : Type} (f : elt -> B -> B) (s : t) (i : B) : B :=
-    List.fold_left (flip f) (elements s) i.
+    snd (fold_elementsZ (fun b z => Some (f (Enc.decode z) b)) i s).
 
   Definition for_all (f : elt -> bool) (s : t) : bool :=
-    List.forallb f (elements s).
+    snd (fold_elementsZ (fun b z =>
+      if b then
+        Some (f (Enc.decode z))
+      else None) true s).
 
   Definition exists_ (f : elt -> bool) (s : t) : bool :=
-    List.existsb f (elements s).
-
-  Definition partition (f : elt -> bool) (s : t) : t * t :=
-    (filter f s, filter (fun x => negb (f x)) s).
+    snd (fold_elementsZ (fun b z =>
+      if b then
+        None
+      else Some (f (Enc.decode z))) false s).
 
   Fixpoint cardinalN c (s : t) : N := match s with
     | nil => c
@@ -542,18 +651,33 @@ Module Ops (Enc : ElementEncode) <: WOps Enc.E.
 
   Definition cardinal (s : t) : nat := N.to_nat (cardinalN (0%N) s).
 
-  Definition chooseZ (s : t) : option Z :=
+  Definition min_eltZ (s : t) : option Z :=
     match s with
     | nil => None
     | (x, _) :: _ => Some x
     end.
 
-  Definition choose (s : t) : option elt :=
-    match (chooseZ s) with
+  Definition min_elt (s : t) : option elt :=
+    match (min_eltZ s) with
     | None => None
     | Some x => Some (Enc.decode x)
     end.
 
+  Definition choose := min_elt.
+
+  Fixpoint max_eltZ (s : t) : option Z :=
+    match s with
+    | nil => None
+    | (x, c) :: nil => Some (Z.pred (x + Z.of_N c))
+    | (x, _) :: s' => max_eltZ s'
+    end.
+
+  Definition max_elt (s : t) : option elt :=
+    match (max_eltZ s) with
+    | None => None
+    | Some x => Some (Enc.decode x)
+    end.
+  
 End Ops.
 
 
@@ -710,85 +834,181 @@ Module Raw (Enc : ElementEncode).
     }
   Qed.
 
-  Lemma elementsZ_aux''_irrel : forall c acc x H1 H2,
-      elementsZ_aux'' acc x c H1 = elementsZ_aux'' acc x c H2.
+  Lemma fold_elementsZ_aux_irrel {A} :
+    forall f c (acc : A) x H1 H2,
+      fold_elementsZ_aux f acc x c H1 =
+      fold_elementsZ_aux f acc x c H2.
   Proof.
-    intro c.
-    induction c using (well_founded_ind lt_wf_0).
+    intros f c.
+    induction c as [c IH] using (well_founded_ind lt_wf_0).
     case_eq c. {
-      intros H_c acc x; case; intro; case; intro.
+      intros H_c acc x; case; intro H_H1; case; intro H_H2.
       reflexivity.
     } {
-      intros p H_c acc x; case; intro; case; intro.
-      simpl.
-      apply H.
+      intros p H_c acc x; case; intro H_H1; case; intro H_H2.
+      unfold fold_elementsZ_aux; fold (@fold_elementsZ_aux A).
+      case (f acc x) => // acc'.
+      apply IH.
       rewrite H_c.
-      rewrite N.pos_pred_spec.
       apply N.lt_pred_l.
       discriminate.
     }
   Qed.
 
 
-  Lemma elementsZ_aux'_pos : forall s x p,
-      elementsZ_aux' s x (N.pos p) = elementsZ_aux' (x::s) (Z.succ x) (Pos.pred_N p).
+  Lemma fold_elementsZ_single_pos {A} : forall f (acc : A) x p,
+    fold_elementsZ_single f acc x (N.pos p) =
+    match f acc x with
+    | Some acc' =>
+        fold_elementsZ_single f acc' (Z.succ x)
+         (N.pred (N.pos p))
+    | None => (true, acc)
+    end.
   Proof.
-    intros s x p.
-    unfold elementsZ_aux'.
-    unfold elementsZ_aux''.
+    intros f acc x p.        
+    unfold fold_elementsZ_single.
+    unfold fold_elementsZ_aux.
     case: (lt_wf_0 _).
+    fold (@fold_elementsZ_aux A).
     intro.
-    apply elementsZ_aux''_irrel.
+    case (f acc x) => // acc'.
+    apply fold_elementsZ_aux_irrel.
   Qed.
 
 
-  Lemma elementsZ_aux'_zero : forall s x,
-      elementsZ_aux' s x (0%N) = s.
+  Lemma fold_elementsZ_single_zero {A} : forall f (acc : A) x,
+      fold_elementsZ_single f acc x (0%N) = (false, acc).
   Proof.
-    intros s x.
-    unfold elementsZ_aux'.
-    by case (lt_wf_0 (0%N)); intro.
+    intros f acc x.
+    unfold fold_elementsZ_single.
+    case (lt_wf_0 (0%N)); intro.
+    unfold fold_elementsZ_aux.
+    reflexivity.
   Qed.
 
 
-  Lemma elementsZ_aux'_succ : forall s x c,
-      elementsZ_aux' s x (N.succ c) = elementsZ_aux' (x::s) (Z.succ x) c.
+  Lemma fold_elementsZ_single_succ {A} : forall f (acc : A) x c,
+    fold_elementsZ_single f acc x (N.succ c) =
+    match f acc x with
+      | Some acc' =>
+          fold_elementsZ_single f acc' (Z.succ x) c
+      | None => (true, acc)
+    end.
   Proof.
-    intros s x c.
-    case c.
-    - by rewrite elementsZ_aux'_pos.
-    - intro p; simpl.
-      rewrite elementsZ_aux'_pos.
-        by rewrite Pos.pred_N_succ.
-  Qed.
-
-
-  Lemma elementsZ_single_intro : forall c s x,
-     elementsZ_aux' s x c =
-     (List.rev (elementsZ_single x c)) ++ s.
-  Proof.
-    induction c as [| c' IH] using N.peano_ind. {
-      intros s x.
-      rewrite elementsZ_aux'_zero.
-      rewrite elementsZ_single_base //.
+    intros f acc x c.
+    case c. {
+      by rewrite fold_elementsZ_single_pos.
     } {
-      intros s x.
-      rewrite elementsZ_aux'_succ elementsZ_single_succ_front IH.
-      rewrite -app_assoc /= //.
+      intro p; simpl.
+      rewrite fold_elementsZ_single_pos.
+      case (f acc x) => // acc' /=.
+      by rewrite Pos.pred_N_succ.
     }
   Qed.
 
+  Fixpoint fold_opt {A B} f (acc : A) (bs : list B) : (bool * A) :=
+    match bs with
+      | nil => (false, acc)
+      | (b :: bs') =>
+        match f acc b with
+        | Some acc' => fold_opt f acc' bs'
+        | None => (true, acc)
+        end
+    end.
 
-  Lemma elementsZ_aux_alt_def : forall s acc,
-    elementsZ_aux acc s = elementsZ s ++ acc. 
+  Lemma fold_opt_list_cons : forall {A} (bs : list A) (acc : list A),
+    fold_opt (fun l x => Some (x :: l)) acc bs =
+    (false, List.rev bs ++ acc).
   Proof.
-    induction s as [| [x c] s' IH]. {
-      move => acc.
-      rewrite /elementsZ_aux elementsZ_nil app_nil_l //.
+    induction bs as [| b bs' IH] => acc. {
+      by simpl.
     } {
-      move => acc.
-      rewrite /elementsZ /elementsZ_aux -/elementsZ_aux !IH !elementsZ_single_intro.
-      rewrite -!app_assoc app_nil_l //.
+      rewrite /= IH -app_assoc //.
+    }
+  Qed.
+
+  Lemma fold_opt_app {A B} : forall f (acc : A) (l1 l2 : list B),
+    fold_opt f acc (l1 ++ l2) =
+    (let (ab, acc') := fold_opt f acc l1 in
+     if ab then (true, acc') else fold_opt f acc' l2).
+  Proof.
+    intros f acc l1 l2.
+    move : acc.
+    induction l1 as [| b l1' IH] => acc. {
+      rewrite app_nil_l //.
+    } {
+      rewrite /=.
+      case (f acc b); last done.
+      intro acc'.
+      rewrite IH //.
+    }
+  Qed.
+
+  
+  Lemma fold_elementsZ_single_alt_def {A} : forall f c (acc : A) x,
+     fold_elementsZ_single f acc x c =
+     fold_opt f acc (elementsZ_single x c).
+  Proof.
+    intro f.
+    induction c as [| c' IH] using N.peano_ind. {
+      intros acc x.
+      rewrite fold_elementsZ_single_zero
+              elementsZ_single_base /fold_opt //.
+    } {
+      intros acc x.
+      rewrite fold_elementsZ_single_succ
+              elementsZ_single_succ_front /=.
+      case (f acc x); last reflexivity.
+      intro acc'.
+      apply IH.
+    }
+  Qed.
+
+  Lemma fold_elementsZ_nil {A} : forall f (acc : A),
+     fold_elementsZ f acc nil = (false, acc).
+  Proof. done. Qed.
+
+  Lemma fold_elementsZ_cons {A} : forall f (acc : A) y c s,
+    fold_elementsZ f acc ((y, c)::s) =
+    (let (ab, acc') := fold_elementsZ_single f acc y c in
+     if ab then (true, acc') else fold_elementsZ f acc' s).
+  Proof.
+    intros f acc y c s.
+    done.
+  Qed.
+
+
+  Lemma fold_elementsZ_alt_def_aux : forall (s : t) base,
+    (snd (fold_elementsZ
+      (fun (l : list Z) (x : Z) => Some (x :: l)) base s)) =
+    elementsZ s ++ base.
+  Proof.
+    induction s as [| [y1 c1] s' IH] => base. {
+      rewrite elementsZ_nil /fold_elementsZ /fold_opt /snd
+        app_nil_l //.
+    } {
+      rewrite /elementsZ !fold_elementsZ_cons.
+      rewrite !fold_elementsZ_single_alt_def !fold_opt_list_cons.
+      rewrite !IH app_nil_r app_assoc //.
+    }
+  Qed.
+
+  
+  Lemma fold_elementsZ_alt_def {A} : forall f s (acc : A),
+     fold_elementsZ f acc s =
+     fold_opt f acc (rev (elementsZ s)).
+  Proof.
+    intro f.
+    induction s as [| [y1 c1] s' IH] => acc. {
+      by simpl.
+    } {
+      rewrite /elementsZ !fold_elementsZ_cons.
+      rewrite !fold_elementsZ_single_alt_def
+              fold_opt_list_cons app_nil_r
+              fold_elementsZ_alt_def_aux rev_app_distr
+              rev_involutive fold_opt_app.
+      case (fold_opt f acc (elementsZ_single y1 c1)).
+      move => [] //.
     }
   Qed.
 
@@ -796,8 +1016,12 @@ Module Raw (Enc : ElementEncode).
      ((elementsZ s) ++ (List.rev (elementsZ_single x c))). 
   Proof. 
     intros x c s.
-    rewrite /elementsZ /elementsZ_aux -/elementsZ_aux.
-    rewrite !elementsZ_aux_alt_def elementsZ_single_intro !app_nil_r //.
+    rewrite /elementsZ fold_elementsZ_cons
+            !fold_elementsZ_alt_def 
+            fold_elementsZ_single_alt_def.
+    rewrite !fold_opt_list_cons.
+    rewrite !app_nil_r !rev_involutive /=.
+    rewrite fold_elementsZ_alt_def_aux //.
   Qed.
 
   Lemma elements_cons : forall x c s, elements (((x, c) :: s) : t) = 
@@ -899,7 +1123,7 @@ Module Raw (Enc : ElementEncode).
     }
   Qed.
 
-
+ 
   (** *** comparing intervals *)
 
   Ltac Z_named_compare_cases H := match goal with
@@ -1405,6 +1629,16 @@ Module Raw (Enc : ElementEncode).
     
   (** *** Properties of In and InZ *)
 
+  Lemma encode_decode_eq : forall x s, Ok s -> InZ x s ->
+    (Enc.encode (Enc.decode x) = x).
+  Proof.
+    intros x s.
+    rewrite /Ok /IsOk /InZ.
+    move => [_] H_enc H_in_x.
+    move : (H_enc _ H_in_x) => [x'] <-.
+    rewrite Enc.decode_encode_ok //.
+  Qed.
+
   Lemma In_alt_def : forall x s, Ok s -> 
     (In x s <-> List.In x (elements s)).
   Proof.
@@ -1412,7 +1646,7 @@ Module Raw (Enc : ElementEncode).
     rewrite /In InA_alt /elements rev_map_alt_def.
     split. {
       move => [y] [H_y_eq].
-      rewrite -!in_rev !in_map_iff.
+      rewrite -!in_rev !in_map_iff.      
       move => [x'] [H_y_eq'] H_x'_in.
       suff H_x'_eq :  (Enc.encode x = x'). {
         exists x'.
@@ -1472,7 +1706,7 @@ Module Raw (Enc : ElementEncode).
     by rewrite Enc.decode_encode_ok.
   Qed.
 
-
+  
   (** *** Membership specification *)
           
   Lemma memZ_spec :
@@ -2958,41 +3192,6 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
   Qed.
 
   
-  (** *** filter specification *)
-
-  Global Instance filter_ok s f : forall `(Ok s), Ok (filter f s).
-  Proof.
-    move => _.
-    rewrite /filter /from_elements.
-    apply add_list_ok, empty_ok.
-  Qed.
-
-  Lemma filter_spec :
-   forall (s : t) (x : elt) (f : elt -> bool),
-   Proper (Enc.E.eq==>eq) f ->
-   (In x (filter f s) <-> In x s /\ f x = true).
-  Proof.
-    move => s x f H_prop.
-    rewrite /filter /from_elements add_list_spec  empty_spec' /In !InA_alt.
-    setoid_rewrite filter_In.
-    split. {
-      move => [] //.
-      move => [y] [H_y_eq] [H_y_in] H_fy.
-      split; first by exists y.
-      rewrite -H_fy.
-      by f_equiv.
-    } {
-      move => [] [y] [H_y_eq] H_y_in H_fx.
-      left. 
-      exists y.
-      split; last split; try assumption.
-      apply Logic.eq_sym.
-      rewrite -H_fx.
-      by f_equiv.
-    }
-  Qed.
-
-
   (** *** diff specification *)
  
   Lemma diff_aux_alt_def :
@@ -4222,195 +4421,37 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
     }
   Qed.
 
-  Lemma elementsZ_cons_le_start : forall x cx xs y cy ys,
-     interval_list_invariant ((x, cx) :: xs) = true ->
-     interval_list_invariant ((y, cy) :: ys) = true ->
-     (forall z, InZ z ((y, cy) :: ys) ->
-                InZ z ((x, cx) :: xs)) ->
-     (x <= y). 
-  Proof.
-    intros x cx xs y cy ys.
-    rewrite !interval_list_invariant_cons.
-    move => [H_interval_list_elements_greater_xs] [H_cx] H_xs [H_interval_list_elements_greater_ys] [H_cy] H_ys H_impl.
-    have H_lt_xs : (forall zz : Z, InZ zz xs -> (x + Z.of_N cx) < zz). {
-      apply interval_list_elements_greater_alt2_def => //.
-    }
-
-    move : (Z.lt_ge_cases y x) => [] // H_y_lt.
-    apply Z.le_trans with (m := x + Z.of_N cx). {
-      apply Z_le_add_r.
-    } {
-      apply Z.lt_le_incl, H_lt_xs.
-      have H_pre : InZ y ((y, cy) :: ys). {
-        rewrite InZ_cons.
-        left.
-        by apply In_elementsZ_single_hd. 
-      }
-      move : (H_impl y H_pre).
-      rewrite InZ_cons => [] [] //.
-      rewrite In_elementsZ_single.
-      move => [H_x_le].
-      exfalso.
-      eapply Z.nlt_ge; first apply H_x_le.
-      done.
-    }
-  Qed.
-
-  Lemma elementsZ_cons_le_end : forall x cx xs y cy ys,
-     interval_list_invariant ((x, cx) :: xs) = true ->
-     interval_list_invariant ((y, cy) :: ys) = true ->
-     (x <= y + Z.of_N cy) ->
-     (forall z, InZ z ((x, cx) :: xs) ->
-                InZ z ((y, cy) :: ys)) ->
-     (x + Z.of_N cx <= y + Z.of_N cy). 
-  Proof.
-    intros x cx xs y cy ys.
-    rewrite !interval_list_invariant_cons.
-    move => [H_interval_list_elements_greater_xs] [H_cx] H_xs [H_interval_list_elements_greater_ys] [H_cy] H_ys H_x_le H_impl.
-
-    apply Z.nlt_ge => H_y_lt.
-
-    have H_nin : ~(InZ (y + Z.of_N cy) ((y, cy) :: ys)). {
-      rewrite InZ_cons In_elementsZ_single.
-      move => []. {
-        move => [_].
-        apply Z.lt_irrefl.
-      } {
-        eapply (Nin_elements_greater ys (y + Z.of_N cy)) => //.
-        apply Z.le_refl.
-      }
-    }
-    apply H_nin, H_impl => {H_nin}.
-    
-    rewrite InZ_cons In_elementsZ_single.
-    by left.
-  Qed.
-
-
-  Lemma elementsZ_cons_equiv_hd : forall x cx xs y cy ys,
-     interval_list_invariant ((x, cx) :: xs) = true ->
-     interval_list_invariant ((y, cy) :: ys) = true ->
-     (forall z, InZ z ((x, cx) :: xs) <->
-                InZ z ((y, cy) :: ys)) ->
-     (x = y) /\ (cx = cy). 
-  Proof.
-    intros x cx xs y cy ys H_ok_xs H_ok_ys H_equiv.
-    have H_xy_eq : x = y. {
-      apply Z.le_antisymm; (
-        eapply (elementsZ_cons_le_start); eauto;
-        apply H_equiv
-      ).
-    }
-    subst. split => //.
-
-    have : (y + Z.of_N cx = y + Z.of_N cy). {
-      apply Z.le_antisymm; (
-        eapply elementsZ_cons_le_end; eauto; [
-          apply Z_le_add_r |
-          apply H_equiv
-        ]
-      ).
-    }
-    rewrite Z.add_cancel_l.
-    apply N2Z.inj.
-  Qed.
-
-
-  Lemma elementsZ_single_equiv : forall x cx y cy,
-     (cx <> 0)%N ->
-     (cy <> 0)%N ->
-     (forall z, List.In z (elementsZ_single x cx) <->
-                List.In z (elementsZ_single y cy)) ->
-     (x = y) /\ (cx = cy). 
-  Proof.
-    intros x cx y cy H_cx H_cy H.
-    apply elementsZ_cons_equiv_hd with (xs := nil) (ys := nil). {
-      rewrite interval_list_invariant_cons //.
-    } {
-      rewrite interval_list_invariant_cons //.
-    } {
-      intro z. 
-      move : (H z) => {H}.
-      rewrite !InZ_cons => -> //.
-    }
-  Qed.
-   
 
   Lemma equal_elementsZ :
     forall (s s' : t) {Hs : Ok s} {Hs' : Ok s'},
     (forall x, (InZ x s <-> InZ x s')) -> (s = s').
   Proof.
-    induction s as [| [x cx] xs IH]. {
-      move => [] //.
-      move => [y cy ys] _ /Ok_cons [_] [H_cy] _.
-      rewrite /InZ elementsZ_nil /= => H.
-      exfalso.
-      rewrite (H y) elementsZ_cons in_app_iff -in_rev.
-      right.
-      apply In_elementsZ_single_hd => //.
-    } {  
-      move => []. {
-        move => /Ok_cons [_] [H_xc] _ _.
-        rewrite /InZ elementsZ_nil /= => H.
-        exfalso.
-        rewrite -(H x) elementsZ_cons in_app_iff -in_rev.
-        right.
-        apply In_elementsZ_single_hd => //.
-      } {
-        move => [y cy ys] H_ok_xxs H_ok_yys. 
-        rewrite /InZ.
-        move => H_in.
-
-        have [H_ok_xs H_interval_list_elements_greater_xs] : Ok xs /\ interval_list_elements_greater (x + Z.of_N cx) xs = true. {
-          move : H_ok_xxs => /Ok_cons; tauto.
-        }
-        have [H_ok_ys H_interval_list_elements_greater_ys] : Ok ys /\ interval_list_elements_greater (y + Z.of_N cy) ys = true. {
-          move : H_ok_yys => /Ok_cons. tauto.
-        }
-        have H_isok_xs : interval_list_invariant xs=true by apply H_ok_xs.
-        have H_isok_ys : interval_list_invariant ys=true by apply H_ok_ys.
-
-        have [H_x_eq H_cx_eq] : (x = y) /\ (cx = cy). {
-          eapply elementsZ_cons_equiv_hd. 
-            - by apply H_ok_xxs.
-            - by apply H_ok_yys.
-            - by apply H_in.
-        }
-        subst.
-
-        suff -> : (xs = ys) by [].
-        suff H_suff : (forall x : Z, InZ x xs <-> InZ x ys) by apply IH.
-
-        move => z.
-        move : (H_in z) => {H_in}.
-        move : (Nin_elements_greater _ _ H_interval_list_elements_greater_xs H_isok_xs z).
-        move : (Nin_elements_greater _ _ H_interval_list_elements_greater_ys H_isok_ys z).
-        rewrite /InZ !elementsZ_cons !in_app_iff -!in_rev !In_elementsZ_single.
-        move => H_nin_ys H_nin_xs H_equiv.
-        split. {
-          move => H_z_in.
-          have : List.In z (elementsZ ys) \/ y <= z < y + Z.of_N cy. {
-            rewrite -H_equiv.
-            by left.
-          }
-          move => [] //.
-          move => [_] /Z.lt_le_incl H_z_le.
-          contradict H_z_in.
-          by apply H_nin_xs.
-        } {
-          move => H_z_in.
-          have : List.In z (elementsZ xs) \/ y <= z < y + Z.of_N cy. {
-            rewrite H_equiv.
-            by left.
-          }
-          move => [] //.
-          move => [_] /Z.lt_le_incl H_z_le.
-          contradict H_z_in.
-          by apply H_nin_ys.
-        }
-      }
+    intros s s'.
+    move => H_ok_s H_ok_s' H_InZ_eq.
+    have [] : ((subset s s' = true) /\ (subset s' s = true)). {
+      rewrite !subset_spec /Subset.
+      split => x; rewrite !In_InZ H_InZ_eq //.
     }
+    have : interval_list_invariant s' = true by apply H_ok_s'.
+    have : interval_list_invariant s = true by apply H_ok_s.
+    clear H_ok_s H_ok_s' H_InZ_eq.
+    move : s s'.
+    induction s as [| [x1 c1] s1 IH];
+      case s' as [| [x2 c2] s2] => //.
+    rewrite !interval_list_invariant_cons.
+    move => [H_gr_s1] [H_c1_neq_0] H_inv_s1.
+    move => [H_gr_s2] [H_c2_neq_0] H_inv_s2.
+    rewrite subset_flatten_alt_def
+            (subset_flatten_alt_def ((x2, c2)::s2)).
+    rewrite (interval_compare_swap x1 c1); last by left.
+    move : (interval_compare_elim x1 c1 x2 c2).
+    case (interval_compare (x1, c1) (x2, c2)) => //.
+    move => [->] -> H_sub_s12 H_sub_s21.
+
+    suff -> : s1 = s2 by done.
+    by apply IH.
   Qed.
+ 
 
   Lemma equal_spec :
     forall (s s' : t) {Hs : Ok s} {Hs' : Ok s'},
@@ -4450,59 +4491,324 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
     }
   Qed.
 
+  (** *** compare *)
+  Definition lt (s1 s2 : t) : Prop := (compare s1 s2 = Lt).
 
+  Lemma compare_eq_Eq : forall s1 s2,
+    (compare s1 s2 = Eq <-> equal s1 s2 = true).
+  Proof.
+    induction s1 as [| [y1 c1] s1' IH];
+      case s2 as [| [y2 c2] s2'] => //.
+    rewrite /= !andb_true_iff -IH Z.eqb_eq N.eqb_eq.
+    move : (Z.compare_eq_iff y1 y2).
+    case (Z.compare y1 y2). {
+      move => H.
+      have -> : y1 = y2. by apply H.
+      clear H.
+
+      move : (N.compare_eq_iff c1 c2).
+      case (N.compare c1 c2). {
+        move => H.
+        have -> : c1 = c2. by apply H.
+        tauto.
+      } {
+        move => H.
+        have H_neq : ~(c1 = c2). by rewrite -H => {H}.
+        tauto.
+      } {        
+        move => H.
+        have H_neq : ~(c1 = c2). by rewrite -H => {H}.
+        tauto.
+      }
+    } {
+      move => H.
+      have H_neq : ~(y1 = y2). by rewrite -H => {H}.
+      tauto.
+    } {
+      move => H.
+      have H_neq : ~(y1 = y2). by rewrite -H => {H}.
+      tauto.
+    }
+  Qed.
+
+  Lemma compare_eq_Lt_nil_l : forall s,
+    compare nil s = Lt <-> s <> nil.
+  Proof.
+    intros s.
+    case s => //=.
+    split => //.
+  Qed.
+
+  Lemma compare_eq_Lt_nil_r : forall s,
+    ~(compare s nil = Lt).
+  Proof.
+    intros s.
+    case s as [| [y1 c1] s'] => //=.
+  Qed.
+  
+  Lemma compare_eq_Lt_cons : forall y1 y2 c1 c2 s1 s2,
+    compare ((y1, c1)::s1) ((y2, c2)::s2) = Lt <->
+    (y1 < y2) \/ ((y1 = y2) /\ (c1 < c2)%N) \/
+    ((y1 = y2) /\ (c1 = c2) /\ compare s1 s2 = Lt).
+  Proof.
+    intros y1 y2 c1 c2 s1 s2.
+    rewrite /=.
+    case_eq (Z.compare y1 y2). {
+      move => /Z.compare_eq_iff ->.
+      case_eq (N.compare c1 c2). {
+        move => /N.compare_eq_iff ->.
+        split. {
+          move => H.
+          right; right.
+          done.
+        } {
+          move => [| []]. {
+            move => /Z.lt_irrefl //.
+          } {
+            move => [_] /N.lt_irrefl //.
+          } {
+            move => [_] [_] -> //.
+          }
+        }
+      } {
+        move => /N.compare_lt_iff H_c1_lt.
+        split => //.
+        move => _.
+        right; left. done.
+      } {
+        move => /N.compare_gt_iff H_c2_lt.
+        split => //.
+        move => [| []]. {
+          move => /Z.lt_irrefl //.
+        } {
+          move => [_] /N.lt_asymm //.
+        } {
+          move => [_] [] H_c1_eq.
+          contradict H_c2_lt.
+          subst c1.
+          by apply N.lt_irrefl.
+        }
+      }
+    } {
+      move => /Z.compare_lt_iff.
+      tauto.
+    } {
+      move => /Z.compare_gt_iff H_y2_lt.
+      split => //.
+      move => [| []]. {
+        move => /Z.lt_asymm //.
+      } {
+        move => [] H_y1_eq.
+        exfalso. omega.
+      } {
+        move => [] H_y1_eq.
+        exfalso. omega.
+      }
+    }
+  Qed.
+  
+  
+  Lemma compare_antisym: forall (s1 s2 : t),
+    (compare s1 s2) = CompOpp (compare s2 s1).
+  Proof.
+    induction s1 as [| [y1 c1] s1' IH];
+      case s2 as [| [y2 c2] s2'] => //.
+    rewrite /= (Z.compare_antisym y1 y2) (N.compare_antisym c1 c2).
+    case (Z.compare y1 y2) => //=.
+    case (N.compare c1 c2) => //=.
+  Qed.
+
+
+  Lemma compare_spec : forall s1 s2,
+    CompSpec eq lt s1 s2 (compare s1 s2).
+  Proof.
+    intros s1 s2.
+    rewrite /CompSpec /lt (compare_antisym s2 s1).
+    case_eq (compare s1 s2). {
+      rewrite compare_eq_Eq equal_alt_def => ->.
+      by apply CompEq.
+    } {
+      move => _.
+      by apply CompLt.
+    } {
+      move => _.
+      by apply CompGt.
+    }
+  Qed.
+
+  Lemma lt_Irreflexive : Irreflexive lt.
+  Proof.
+    rewrite /Irreflexive /Reflexive /complement /lt.
+    intros x.
+    suff -> : compare x x = Eq by done.
+    rewrite compare_eq_Eq equal_alt_def //.
+  Qed.
+
+  Lemma lt_Transitive : Transitive lt.
+  Proof.
+    rewrite /Transitive /lt.
+    induction x as [| [y1 c1] s1' IH];
+      case y as [| [y2 c2] s2'];
+      case z as [| [y3 c3] s3'] => //.
+
+    rewrite !compare_eq_Lt_cons.
+    move => [H_y1_lt | [[->] H_c1_lt | [->] [->] H_comp]]
+            [H_y2_lt | [[<-] H_c2_lt | [<-] [<-] H_comp']]. {
+      left.
+      by apply Z.lt_trans with (m := y2).
+    } {
+      by left.
+    } {
+      by left.
+    } {
+      by left.
+    } {
+      right; left.
+      split => //.
+      by apply N.lt_trans with (m := c2).
+    } {
+      by right; left.
+    } {
+      by left.
+    } {
+      by right; left.
+    } {
+      right; right.
+      split => //.
+      split => //.
+      by apply (IH s2').
+    }
+  Qed.
+             
+  (** *** elements is sorted *)
+  
+  Lemma elementsZ_single_sorted : forall c x,
+    sort Z.lt (elementsZ_single x c).
+  Proof.
+    induction c as [| c' IH] using N.peano_ind. {
+      intro x.
+      rewrite elementsZ_single_base.
+      apply Sorted_nil.
+    } {
+      intro x.
+      rewrite elementsZ_single_succ_front.
+      apply Sorted_cons. {
+        apply IH.
+      } {
+        case (N.zero_or_succ c'). {
+          move => ->.
+          rewrite elementsZ_single_base //.
+        } {
+          move => [c''] ->.
+          rewrite elementsZ_single_succ_front.
+          constructor.
+          apply Z.lt_succ_diag_r.
+        }
+      }
+    }
+  Qed.
+
+  Lemma elementsZ_sorted : forall s,
+    interval_list_invariant s = true ->
+    sort Z.lt (rev (elementsZ s)).
+  Proof.
+    induction s as [| [y c] s' IH]. {
+      move => _.
+      rewrite elementsZ_nil.
+      apply Sorted_nil.
+    } {
+      rewrite interval_list_invariant_cons elementsZ_cons
+              rev_app_distr rev_involutive.
+      move => [H_gr] [H_c_neq_0] H_inv_s'.
+      apply SortA_app with (eqA := Logic.eq). {
+        apply eq_equivalence.
+      } {
+        apply Z.lt_strorder.
+      } {
+        apply elementsZ_single_sorted.
+      } {
+        by apply IH.
+      } {
+        intros x1 x2.
+        move => /InA_alt [_] [<-] /In_elementsZ_single [_ H_x1_lt].
+        move => /InA_alt [_] [<-].
+        rewrite -In_rev => H_x2_in.
+
+        apply Z.lt_trans with (m := (y + Z.of_N c)) => //.
+        eapply interval_list_elements_greater_alt2_def;
+          eauto.
+      }
+    }
+  Qed.
+
+  
+  Lemma elements_sorted : forall s,
+    Ok s ->
+    sort Enc.E.lt (elements s).
+  Proof.
+    move => s [H_inv] H_enc.
+    rewrite /elements rev_map_alt_def -map_rev.
+    have : (forall x : Z, List.In x (rev (elementsZ s)) ->
+           exists e : Enc.E.t, Enc.encode e = x). {
+      move => x.
+      move : (H_enc x).
+      rewrite In_rev //.
+    }
+    move : (elementsZ_sorted s H_inv) => {H_enc}.
+    generalize (rev (elementsZ s)).
+    induction l as [| x xs IH]. {
+      rewrite /= => _ _.
+      apply Sorted_nil.
+    } {
+      move => H_sort H_enc.
+      apply Sorted_inv in H_sort as [H_sort H_hd_rel].
+      simpl.
+      apply Sorted_cons. {
+        apply IH => //.
+        move => xx H_xx_in.
+        apply H_enc.
+        by apply in_cons.
+      } {
+        move : H_hd_rel H_enc.
+        case xs => //=.
+        move => x' xs' H_hd_rel H_enc.
+        apply HdRel_inv in H_hd_rel.
+        apply HdRel_cons.
+        rewrite -Enc.encode_lt.
+        have [y H_y] : (exists y, Enc.encode y = x). {
+          apply H_enc. by left.
+        }
+        have [y' H_y'] : (exists y', Enc.encode y' = x'). {
+          apply H_enc. by right; left.
+        }
+        move : H_hd_rel.
+        rewrite -!H_y -!H_y' !Enc.decode_encode_ok //.
+      }
+    }
+  Qed.   
+        
+  
   (** *** choose specification *)
 
-  Definition chooseZ_spec1 :
+  Definition min_eltZ_spec1 :
     forall (s : t) (x : Z),
       interval_list_invariant s = true ->
-      chooseZ s = Some x -> InZ x s. 
+      min_eltZ s = Some x -> InZ x s. 
   Proof.   
     intros s x.
     case s as [| [x' c] s']. {
-      rewrite /chooseZ //.
+      rewrite /min_eltZ //.
     } {
-      rewrite /chooseZ InZ_cons interval_list_invariant_cons.
+      rewrite /min_eltZ InZ_cons interval_list_invariant_cons.
       move => [_] [H_c_neq] _ [->].
       left.
       by apply In_elementsZ_single_hd.
     }
   Qed.
 
-  Definition chooseZ_spec2 :
-    forall (s : t),
-      chooseZ s = None -> forall x, ~InZ x s. 
-  Proof.   
-    intros s.
-    case s as [| [x' c] s'];
-      rewrite /chooseZ //.
-    move => _ x //.
-  Qed.
-
-  Definition choose_spec1 :
-    forall (s : t) (x : elt) (Hs : Ok s), choose s = Some x -> In x s. 
-  Proof.   
-    rewrite /choose.
-    move => s x H_ok.
-    case_eq (chooseZ s) => //.
-    move => z H_choose [<-].
-    apply InZ_In => //.
-    apply chooseZ_spec1 => //.
-    apply H_ok.
-  Qed.
-
-  Definition choose_spec2 :
-    forall s : t, choose s = None -> Empty s.
-  Proof.   
-    rewrite /choose /chooseZ /Empty /In.
-    case s as [| [x' c] s'] => //.
-    move => _ e.
-    rewrite elements_nil InA_nil //.
-  Qed.
-
-  Lemma chooseZ_min :
+  Lemma min_eltZ_spec2 :
     forall (s : t) (x y : Z) (Hs : Ok s),
-    chooseZ s = Some x -> InZ y s -> ~ Z.lt y x.
+    min_eltZ s = Some x -> InZ y s -> ~ Z.lt y x.
   Proof.
     intros s x y H_ok H_min H_in H_y_lt_x.
     eapply (Nin_elements_greater s (Z.pred x)) => //; last apply H_in. {
@@ -4518,13 +4824,205 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
     }
   Qed.
 
-  Lemma chooseZ_spec3: forall s s' x x', Ok s -> Ok s' ->
-   chooseZ s = Some x -> chooseZ s' = Some x' -> Equal s s' -> x = x'.
+  Definition min_eltZ_spec3 :
+    forall (s : t),
+      min_eltZ s = None -> forall x, ~InZ x s. 
+  Proof.   
+    intros s.
+    case s as [| [x' c] s'];
+      rewrite /min_eltZ //.
+    move => _ x //.
+  Qed.
+
+  Definition min_elt_spec1 :
+    forall (s : t) (x : elt) (Hs : Ok s), min_elt s = Some x -> In x s. 
+  Proof.   
+    rewrite /min_elt.
+    move => s x H_ok.
+    case_eq (min_eltZ s) => //.
+    move => z H_min_elt [<-].
+    apply InZ_In => //.
+    apply min_eltZ_spec1 => //.
+    apply H_ok.
+  Qed.
+
+  Definition min_elt_spec2 :
+    forall (s : t) (x y : elt) (Hs : Ok s), min_elt s = Some x -> In y s -> ~(Enc.E.lt y x). 
+  Proof.   
+    rewrite /min_elt.
+    move => s x y H_ok.
+    case_eq (min_eltZ s) => //.
+    move => z H_min_elt [<-].
+    rewrite In_InZ => H_inZ.    
+    have H_y_eq : y = Enc.decode (Enc.encode y). {
+      by rewrite Enc.decode_encode_ok.
+    }
+    rewrite H_y_eq -Enc.encode_lt.
+    apply (min_eltZ_spec2 _ _ _ H_ok); last first. {
+      by rewrite Enc.decode_encode_ok.
+    }
+    suff -> : Enc.encode (Enc.decode z) = z by assumption.
+    apply encode_decode_eq with (s := s) => //.
+    apply min_eltZ_spec1 => //.
+    apply H_ok.
+  Qed.
+
+  Definition min_elt_spec3 :
+    forall s : t, min_elt s = None -> Empty s.
+  Proof.   
+    rewrite /min_elt /min_eltZ /Empty /In.
+    case s as [| [x' c] s'] => //.
+    move => _ e.
+    rewrite elements_nil InA_nil //.
+  Qed.
+
+
+  Definition choose_spec1 :
+    forall (s : t) (x : elt) (Hs : Ok s), choose s = Some x -> In x s. 
+  Proof.   
+    rewrite /choose.
+    apply min_elt_spec1.
+  Qed.
+
+  Definition choose_spec2 :
+    forall s : t, choose s = None -> Empty s.
+  Proof.   
+    rewrite /choose.
+    apply min_elt_spec3.
+  Qed.
+
+  Lemma choose_spec3: forall s s' x x', Ok s -> Ok s' ->
+    choose s = Some x -> choose s' = Some x' -> Equal s s' -> x = x'.
   Proof.
     intros s s' x x' Hs Hs' Hx Hx'.
     rewrite -equal_spec equal_alt_def => H_s_eq.
     move : Hx Hx'.
     rewrite H_s_eq => -> [] //.
+  Qed.
+
+    
+  Definition max_eltZ_spec1 :
+    forall (s : t) (x : Z),
+      interval_list_invariant s = true ->
+      max_eltZ s = Some x -> InZ x s. 
+  Proof.   
+    intros s x.
+    induction s as [| [x' c] s' IH]. {
+      rewrite /max_eltZ //.
+    } {
+      rewrite InZ_cons interval_list_invariant_cons /=.
+      move => [_] [H_c_neq].
+      case s' as [| [y' c'] s'']. {
+        move => _ [<-].
+        left. {
+          rewrite In_elementsZ_single.
+          split. {
+            rewrite -Z.lt_le_pred.
+            by apply Z_lt_add_r.
+          } {
+            apply Z.lt_pred_l.
+          }
+        }
+      } {
+        move => H_inv H_max_eq.
+        right.
+        by apply IH.
+      }
+    }
+  Qed.
+
+  Lemma max_eltZ_spec2 :
+    forall (s : t) (x y : Z),
+    interval_list_invariant s = true ->
+    max_eltZ s = Some x -> InZ y s -> ~ Z.lt x y.
+  Proof.
+    induction s as [| [y c] s' IH]. {
+      done.
+    } {
+      move => x x'.
+      rewrite interval_list_invariant_cons.
+      move => [H_gr] [H_c_neq_0] H_inv_s'.
+      have H_gr' : (forall xx : Z, InZ xx (s') -> y + Z.of_N c < xx). {
+        apply interval_list_elements_greater_alt2_def => //.
+      }
+
+      case s' as [| [y' c'] s'']. {
+        move => [<-].
+        rewrite InZ_cons InZ_nil In_elementsZ_single.
+        omega.
+      } {
+        move => H_max_eq.
+        rewrite InZ_cons.
+        move => []; last by apply IH.
+        rewrite In_elementsZ_single.
+        move => [_] H_x'_lt H_lt_x'.
+
+        have H_x_in : InZ x ((y', c')::s''). {
+          by apply max_eltZ_spec1.
+        }
+        
+        move : (H_gr' _ H_x_in).
+        apply Z.nlt_ge, Z.lt_le_incl.
+        by apply Z.lt_trans with (m := x').
+      }
+    }
+  Qed.
+
+  Lemma max_eltZ_eq_None :
+    forall (s : t),
+      max_eltZ s = None -> s = nil.
+  Proof.
+    induction s as [| [x' c] s' IH] => //.
+    move : IH.
+    case s' as [| [y' c'] s''] => //=.
+    move => H H_pre.
+    move : (H H_pre) => //.
+  Qed.   
+    
+
+  Definition max_eltZ_spec3 :
+    forall (s : t),
+      max_eltZ s = None -> forall x, ~InZ x s. 
+  Proof.
+    move => s /max_eltZ_eq_None -> x /InZ_nil //.
+  Qed.
+
+  Definition max_elt_spec1 :
+    forall (s : t) (x : elt) (Hs : Ok s), max_elt s = Some x -> In x s. 
+  Proof.   
+    rewrite /max_elt.
+    move => s x H_ok.
+    case_eq (max_eltZ s) => //.
+    move => z H_max_elt [<-].
+    apply InZ_In => //.
+    apply max_eltZ_spec1 => //.
+    apply H_ok.
+  Qed.
+
+  Definition max_elt_spec2 :
+    forall (s : t) (x y : elt) (Hs : Ok s), max_elt s = Some x -> In y s -> ~(Enc.E.lt x y). 
+  Proof.   
+    rewrite /max_elt.
+    move => s x y H_ok.
+    move : (H_ok) => [H_inv] _.
+    case_eq (max_eltZ s) => //.
+    move => z H_max_elt [<-].
+    rewrite In_InZ => H_inZ.    
+    rewrite -Enc.encode_lt.
+    apply (max_eltZ_spec2 _ _ _ H_inv) => //.
+    suff -> : Enc.encode (Enc.decode z) = z => //.
+    apply encode_decode_eq with (s := s) => //.
+    apply max_eltZ_spec1 => //.
+  Qed.
+
+  Definition max_elt_spec3 :
+    forall s : t, max_elt s = None -> Empty s.
+  Proof.
+    intro s.
+    rewrite /max_elt /Empty.
+    case_eq (max_eltZ s) => //.
+    move => /max_eltZ_eq_None -> _ x.
+    rewrite /In elements_nil InA_nil //.
   Qed.
 
 
@@ -4535,7 +5033,16 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
    fold f s i = fold_left (flip f) (elements s) i.
   Proof.
     intros s A i f.
-    rewrite /fold //.
+    rewrite /fold fold_elementsZ_alt_def /elements
+            rev_map_alt_def -map_rev.
+    move : i.
+    generalize (rev (elementsZ s)).
+    induction l as [| x xs IH]. {
+      done.
+    } {
+      move => i.
+      rewrite /= IH //.
+    }
   Qed.
 
  
@@ -4574,11 +5081,43 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
    (for_all f s = true <-> For_all (fun x => f x = true) s).
   Proof.
     intros s f Hs H.
-    rewrite /for_all forallb_forall /For_all //.
-    split; (
-      move => HH x; move : {HH} (HH x);
-      rewrite In_alt_def //
-    ).
+    rewrite /for_all /For_all /In fold_elementsZ_alt_def
+            /elements rev_map_alt_def -map_rev.
+    generalize (rev (elementsZ s)).
+    induction l as [| x xs IH]. {      
+      split => // _ x /= /InA_nil //.
+    } {
+      rewrite /=.
+      case_eq (f (Enc.decode x)) => H_f_eq. {
+        rewrite IH.
+        split. {
+          move => HH x' /InA_cons []. {
+            by move => ->.
+          } {
+            apply HH.
+          }
+        } {
+          move => HH x' H_in.
+          apply HH.
+          apply InA_cons.
+          by right.
+        }
+      } {
+        split; move => HH. {
+          contradict HH.
+          case xs => //.
+        } {
+          exfalso.
+          have H_in: (InA Enc.E.eq (Enc.decode x) (Enc.decode x :: map Enc.decode xs)). {
+            apply InA_cons.
+            left.
+            apply Enc.E.eq_equiv.
+          }
+          move : (HH _ H_in).
+          rewrite H_f_eq => //.
+        }
+      }
+    }
   Qed.
 
   (** *** exists specification *)
@@ -4589,46 +5128,526 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
    (exists_ f s = true <-> Exists (fun x => f x = true) s).
   Proof.
     intros s f Hs H.
-    rewrite /exists_ /Exists existsb_exists //.
-    split; (
-      move => [x] [HH1 HH2]; exists x; move : HH1 HH2;
-      rewrite In_alt_def //
-    ).
+    rewrite /exists_ /Exists /In fold_elementsZ_alt_def
+            /elements rev_map_alt_def -map_rev.
+    generalize (rev (elementsZ s)).
+    induction l as [| x xs IH]. {      
+      split => //.
+      move => [x] /= [] /InA_nil //.
+    } {
+      rewrite /=.
+      case_eq (f (Enc.decode x)) => H_f_eq. {
+        split => _. {
+          exists (Enc.decode x).
+          split => //.
+          apply InA_cons.
+          left.
+          apply Enc.E.eq_equiv.
+        } {
+          case xs => //.
+        }
+      } {
+        rewrite IH.
+        split. {
+          move => [x0] [H_in] H_f_x0.
+          exists x0.
+          split => //.
+          apply InA_cons.
+          by right.
+        } {
+          move => [x0] [] /InA_cons H_in H_f_x0.
+          exists x0.
+          split => //.
+          move : H_in => [] // H_in.
+          contradict H_f_x0.
+          rewrite H_in H_f_eq //.
+        }
+      }
+    }
   Qed.
 
-  (** *** partition specification *)
+
+  (** *** filter specification *)    
+    
+  Definition partitionZ_aux_invariant (x : Z) acc c :=
+    interval_list_invariant (List.rev (partitionZ_fold_skip acc c)) = true /\
+    match c with
+      None => (forall y', InZ y' acc -> Z.succ y' < x)
+    | Some (y, c') => (x = y + Z.of_N c')
+    end.
+
+  Lemma partitionZ_aux_invariant_insert : forall x acc c,
+    partitionZ_aux_invariant x acc c ->
+    partitionZ_aux_invariant (Z.succ x) acc
+      (Some (partitionZ_fold_insert c x)).
+  Proof.
+    intros x acc c.
+    rewrite /partitionZ_fold_insert /partitionZ_aux_invariant
+            /partitionZ_fold_skip.
+    case c; last first. {
+      move => [H_inv] H_in.
+      rewrite /= interval_list_invariant_app_iff Z.add_1_r.
+      split; last done.
+      split; first done.
+      split; first done.
+      move => x1 x2.
+      rewrite InZ_rev InZ_cons InZ_nil In_elementsZ_single1.
+      move => H_x1_in [] // <-.
+      by apply H_in.
+    } {
+      move => [y c'].
+      rewrite /= !interval_list_invariant_app_iff
+        N2Z.inj_succ Z.add_succ_r .
+      rewrite !interval_list_invariant_cons !interval_list_invariant_nil.
+      move => [] [H_inv_acc] [] [] _ [H_c_neq_0] _
+        H_in_c ->.      
+      split; last done.
+      split; first done.
+      split. {
+        split; first done.
+        split; last done.
+        apply N.neq_succ_0.
+      } {
+        move => x1 x2.
+        rewrite InZ_cons InZ_nil In_elementsZ_single.
+        move => H_x1_in [] // [H_y_le] H_x2_lt.
+        apply Z.lt_le_trans with (m := y) => //. 
+        apply H_in_c => //.
+        rewrite InZ_cons In_elementsZ_single.
+        left.
+        split. {
+          apply Z.le_refl.
+        } {
+          by apply Z_lt_add_r.
+        }
+      }
+    }
+  Qed.
+
+  Lemma partitionZ_aux_invariant_skip : forall x acc c,
+    partitionZ_aux_invariant x acc c ->
+    partitionZ_aux_invariant (Z.succ x) (partitionZ_fold_skip acc c) None.
+  Proof.
+    intros x acc c.
+    rewrite /partitionZ_fold_skip /partitionZ_aux_invariant
+            /partitionZ_fold_skip.
+    case c; last first. {
+      move => [H_inv] H_in.
+      split; first done.
+      move => y' H_y'_in.
+      apply Z.lt_trans with (m := x). {
+        by apply H_in.
+      } {
+        apply Z.lt_succ_diag_r.
+      }
+    } {
+      move => [y c'] [H_inv] ->.
+      split => //.
+      move => y'.
+      rewrite InZ_cons In_elementsZ_single.
+      move => []. {
+        move => [_].
+        rewrite -Z.succ_lt_mono //.
+      } {
+        move : H_inv.
+        rewrite /= !interval_list_invariant_app_iff interval_list_invariant_cons.
+        move => [_] [] [_] [H_c'_neq] _ H_pre H_y'_in.
+        apply Z.lt_trans with (m := y). {
+          apply H_pre. {
+            by rewrite InZ_rev.
+          } {
+            rewrite InZ_cons.
+            left.
+            by apply In_elementsZ_single_hd.
+          }
+        }
+        apply Z.lt_succ_r, Z_le_add_r.
+      }
+    }
+  Qed.
+
+  Definition partitionZ_fold_current (c : option (Z * N)) :=
+    match c with
+       None => nil
+     | Some yc => yc::nil
+    end.
+  
+  Lemma InZ_partitionZ_fold_current_Some : forall yc y,
+     InZ y (partitionZ_fold_current (Some yc)) <->
+     InZ y (yc :: nil).
+  Proof. done. Qed.
+
+  Lemma InZ_partitionZ_fold_insert : forall c x y l,
+   match c with
+   | Some (y, c') => x = y + Z.of_N c'
+   | None => True
+   end -> (
+   InZ y (partitionZ_fold_insert c x :: l) <->
+    ((x = y) \/ InZ y (partitionZ_fold_current c) \/
+       InZ y l)).
+  Proof.
+    intros c x y l.
+    rewrite /partitionZ_fold_insert /partitionZ_fold_current
+            /partitionZ_fold_skip.
+    case c. {
+      move => [y' c'] ->.
+      rewrite !InZ_cons elementsZ_single_succ in_app_iff
+              InZ_nil /=.
+      tauto.
+    } {
+      rewrite InZ_cons InZ_nil In_elementsZ_single1.
+      tauto.
+    }
+  Qed.  
+
+  Lemma InZ_partitionZ_fold_skip : forall c acc y,
+    InZ y (partitionZ_fold_skip acc c) <->
+    (InZ y (partitionZ_fold_current c) \/ InZ y acc).
+  Proof.
+    intros c acc y.
+    rewrite /partitionZ_fold_skip /partitionZ_fold_current
+            /partitionZ_fold_skip.
+    case c. {
+      move => [y' c'].
+      rewrite !InZ_cons InZ_nil /=.
+      tauto.
+    } {
+      rewrite InZ_nil.
+      tauto.
+    }
+  Qed.  
+  
+  Lemma filterZ_single_aux_props :
+    forall f c x acc cur,
+      partitionZ_aux_invariant x acc cur ->
+      match (filterZ_single_aux f (acc, cur) x c) with
+        (acc', c') =>
+        let r := partitionZ_fold_skip acc' c' in
+        interval_list_invariant (List.rev r) = true /\
+        (forall y', InZ y' r <-> (InZ y' (partitionZ_fold_skip acc cur) \/
+                                    (f y' = true /\ List.In y' (elementsZ_single x c))))
+
+      end.
+  Proof.
+    intro f.
+    induction c as [| c' IH] using N.peano_ind. {
+      intros x acc cur.
+      rewrite /partitionZ_aux_invariant.
+      move => [H_inv] _.
+      rewrite /filterZ_single_aux fold_elementsZ_single_zero /=.
+      tauto.
+    }
+    intros x acc cur H_inv.
+    have -> :  filterZ_single_aux f (acc, cur) x (N.succ c') =
+               filterZ_single_aux f (filterZ_fold_fun f (acc, cur) x) (Z.succ x) c'. {
+        by rewrite /filterZ_single_aux fold_elementsZ_single_succ.
+    }
+    case_eq (filterZ_fold_fun f (acc, cur) x). 
+    move => acc' cur' H_fold_eq.
+
+    case_eq (filterZ_single_aux f (acc', cur') (Z.succ x) c').
+    move => acc'' cur'' H_succ_eq.
+
+    have H_inv' : partitionZ_aux_invariant (Z.succ x) acc' cur'. {
+      move : H_fold_eq H_inv.
+      rewrite /filterZ_fold_fun.
+      case (f x); move => [<-] <-. {
+        apply partitionZ_aux_invariant_insert.
+      } {
+        apply partitionZ_aux_invariant_skip.
+      }
+    }
+   
+    move : (IH (Z.succ x) acc' cur' H_inv') => {IH}.
+    rewrite H_succ_eq /=.
+    set r := partitionZ_fold_skip acc'' cur''.
+    move => [H_inv_r] H_in_r.
+    split; first assumption.
+
+    move => y'.
+    move : H_fold_eq.
+    rewrite H_in_r /filterZ_fold_fun.
+    case_eq (f x) => H_fx [<-] <-. {
+      rewrite InZ_partitionZ_fold_skip InZ_partitionZ_fold_current_Some InZ_partitionZ_fold_skip elementsZ_single_succ_front.
+      rewrite InZ_partitionZ_fold_insert; last first. {
+        move : H_inv.
+        rewrite /partitionZ_aux_invariant => [[_]].
+        case cur => //.
+      }
+      rewrite InZ_nil /=.
+      split; last by tauto.
+      move => []; last by tauto.
+      move => []; last by tauto.
+      move => []. {
+        move => <-.
+        tauto.
+      } {
+        tauto.
+      }
+    } {
+      rewrite InZ_partitionZ_fold_skip /partitionZ_fold_current InZ_partitionZ_fold_skip elementsZ_single_succ_front !InZ_nil /=.
+      split; first by tauto.
+      move => []; first by tauto.
+      move => [] H_fy' []. {
+        move => H_x_eq; subst y'.
+        contradict H_fy'.
+        by rewrite H_fx.
+      } {
+        tauto.
+      }
+    }
+  Qed.
+        
+
+  Lemma filterZ_single_props :
+    forall f c x acc,
+      interval_list_invariant (rev acc) = true ->
+      (forall y' : Z, InZ y' acc -> Z.succ y' < x) ->     
+      match (filterZ_single f acc x c) with
+        r =>
+        interval_list_invariant (List.rev r) = true /\
+        (forall y', InZ y' r <-> (InZ y' acc \/
+                                 (f y' = true /\ List.In y' (elementsZ_single x c))))
+
+      end.
+  Proof.
+    intros f c x acc.
+    move => H_inv H_acc.
+    rewrite /filterZ_single.
+
+    have H_inv' : partitionZ_aux_invariant x acc None. {
+      by rewrite /partitionZ_aux_invariant /=.
+    }
+    move : (filterZ_single_aux_props f c x acc None H_inv').
+    case_eq (filterZ_single_aux f (acc, None) x c).
+    move => acc' cur' /= H_res.
+    tauto.
+  Qed.
+
+  
+  Lemma filterZ_aux_props :
+    forall f s acc,
+      interval_list_invariant s = true ->
+      interval_list_invariant (rev acc) = true ->
+      (forall x1 x2 : Z, InZ x1 acc -> InZ x2 s -> Z.succ x1 < x2) ->   
+      match (filterZ_aux acc f s) with
+        r =>
+        interval_list_invariant r = true /\
+        (forall y', InZ y' r <-> (InZ y' acc \/
+                                 (f y' = true /\ InZ y' s)))
+      end.
+  Proof.
+    intro f.
+    induction s as [| [y c] s' IH]. {
+      intros acc.
+      move => _ H_inv _.
+      rewrite /filterZ_aux.
+      split; first assumption.
+      move => y'; rewrite InZ_rev InZ_nil; tauto.
+    } {
+      intros acc.
+      rewrite interval_list_invariant_cons.
+      move => [H_gr] [H_c_neq_0] H_inv_s' H_inv H_in_acc /=.
+      move : H_gr.
+      rewrite interval_list_elements_greater_alt2_def => // H_gr.
+
+      have H_pre : (forall y' : Z, InZ y' acc -> Z.succ y' < y). {
+        move => x1 H_x1_in.
+        apply H_in_acc => //.
+        rewrite InZ_cons.
+        by left; apply In_elementsZ_single_hd.
+      }
+      
+      move : (filterZ_single_props f c y acc H_inv H_pre) => {H_pre}.
+      set acc' := filterZ_single f acc y c.
+      move => [H_inv'] H_in_acc'.
+
+      have H_pre : (forall x1 x2 : Z,
+                      InZ x1 acc' -> InZ x2 s' -> Z.succ x1 < x2). {
+        move => x1 x2.
+        rewrite H_in_acc' In_elementsZ_single.
+        move => []. {
+          move => H_x1_in H_x2_in.
+          apply H_in_acc => //.
+          rewrite InZ_cons.
+          by right.
+        } {
+          move => [_] [_] H_x1_lt H_x2_in.
+          apply Z.le_lt_trans with (m := y + Z.of_N c).
+            - by apply Z.le_succ_l.
+            - by apply H_gr.
+        }
+      }
+      move : (IH acc' H_inv_s' H_inv' H_pre) => {H_pre}.
+
+      move => [H_inv_r] H_in_r.
+      split; first assumption.
+      move => y'.
+      rewrite H_in_r H_in_acc' InZ_cons.
+      tauto.
+    }
+  Qed.
+
+  Lemma filterZ_props :
+    forall f s,
+      interval_list_invariant s = true ->
+      match (filterZ f s) with r =>
+        interval_list_invariant r = true /\
+        (forall y', InZ y' r <-> (f y' = true /\ InZ y' s))
+      end.
+  Proof.
+    intros f s H_inv_s.
+    rewrite /filterZ.
+
+    have H_pre_1 : interval_list_invariant (rev nil) = true by done.
+    have H_pre_2 : (forall x1 x2 : Z, InZ x1 nil -> InZ x2 s -> Z.succ x1 < x2) by done.
+    
+    move : (filterZ_aux_props f s nil H_inv_s H_pre_1 H_pre_2) => {H_pre_1} {H_pre_2}.
+    move => [H_inv'] H_in_r.
+    split; first assumption.
+    move => y'.
+    rewrite H_in_r InZ_nil.
+    tauto.
+  Qed.
+
+  Global Instance filter_ok s f : forall `(Ok s), Ok (filter f s).
+  Proof.
+    move => [H_inv H_enc].
+    rewrite /filter.
+    set f' := (fun z : Z => f (Enc.decode z)).
+    move : (filterZ_props f' s H_inv).
+    move => [H_inv'] H_in_r.
+    rewrite /Ok /IsOk /is_encoded_elems_list.
+    split; first assumption.
+    move => x /H_in_r [_] H_x_in.
+    by apply H_enc.
+  Qed.
+
+  Lemma filter_spec :
+   forall (s : t) (x : elt) (f : elt -> bool),
+   Ok s ->      
+   (In x (filter f s) <-> In x s /\ f x = true).
+  Proof.
+    move => s x f H_ok.
+    suff H_suff :
+      (forall x, (InZ x (filter f s)) <->
+                 InZ x s /\ f (Enc.decode x) = true). {
+      rewrite !In_alt_def /elements !rev_map_alt_def
+              -!in_rev !in_map_iff.
+      setoid_rewrite H_suff.
+      rewrite /InZ.
+      split. {
+        move => [y] [<-] [?] ?.
+        split => //.
+        by exists y.
+      } {
+        move => [] [y] [<-] ? ?.
+        by exists y.
+      }
+    }
+    rewrite /filter.
+    set f' := (fun z : Z => f (Enc.decode z)).
+    move : (H_ok) => [H_inv _].
+    move : (filterZ_props f' s H_inv).
+    move => [H_inv'] H_in_r.
+    move => y; rewrite H_in_r; tauto.
+  Qed.
+  
+
+  (** *** partition specification *)    
+
+  Lemma partitionZ_single_aux_alt_def : forall f c y acc_t c_t acc_f c_f,
+    partitionZ_single_aux f ((acc_t, c_t), (acc_f, c_f)) y c =
+    (filterZ_single_aux f (acc_t, c_t) y c,
+     filterZ_single_aux (fun x : Z => negb (f x)) (acc_f, c_f) y c).
+  Proof.
+    intros f.
+    rewrite /partitionZ_single_aux /filterZ_single_aux.
+    induction c as [| c' IH] using N.peano_ind. {
+      intros y acc_t c_t acc_f c_f.
+      rewrite !fold_elementsZ_single_zero //.                       } {
+      intros y acc_t c_t acc_f c_f.
+      rewrite !fold_elementsZ_single_succ.
+      case_eq (partitionZ_fold_fun f (acc_t, c_t, (acc_f, c_f)) y) => [] [acc_t' c_t'] [acc_f' c_f'] H_fold_eq.
+      rewrite IH => {IH}.
+      suff : (filterZ_fold_fun f (acc_t, c_t) y = (acc_t', c_t')) /\
+             (filterZ_fold_fun (fun x : Z => negb (f x)) (acc_f, c_f) y = (acc_f', c_f')). {
+        move => [->] -> //.
+      }
+      move : H_fold_eq.
+      rewrite /partitionZ_fold_fun /filterZ_fold_fun.
+      case (f y); move => [<-] <- <- <- //.
+    }
+  Qed.
+                      
+  Lemma partitionZ_aux_alt_def : forall f s acc_t acc_f,
+   partitionZ_aux acc_t acc_f f s =
+   (filterZ_aux acc_t f s,
+    filterZ_aux acc_f (fun x : Z => negb (f x)) s).
+  Proof.
+    intros f.
+    induction s as [| [y c] s' IH]. {
+      done.
+    } {
+      intros acc_t acc_f.
+      rewrite /= /partitionZ_single /filterZ_single
+              partitionZ_single_aux_alt_def.
+      case (filterZ_single_aux f (acc_t, None) y c) => acc_t' c_t'.
+      case (filterZ_single_aux (fun x : Z => negb (f x)) (acc_f, None) y c) => acc_f' c_f'.
+      rewrite IH //.
+    }
+  Qed.
+      
+  Lemma partitionZ_alt_def : forall f s,
+    partitionZ f s = (filterZ f s,
+                      filterZ (fun x => negb (f x)) s).
+  Proof.
+    intros f s.
+    rewrite /partitionZ /filterZ
+            partitionZ_aux_alt_def //.    
+  Qed.
+
+  Lemma partition_alt_def : forall f s,
+    partition f s = (filter f s,
+                     filter (fun x => negb (f x)) s).
+  Proof.
+    intros f s.
+    rewrite /partition /filter partitionZ_alt_def.
+    done.
+  Qed.
+
 
   Global Instance partition_ok1 s f : forall `(Ok s), Ok (fst (partition f s)).
   Proof.
-    intros H_ok.
-    rewrite /partition /fst.
+    move => H_ok.
+    rewrite partition_alt_def /fst.
     by apply filter_ok.
-  Qed.
+  Qed.  
 
   Global Instance partition_ok2 s f : forall `(Ok s), Ok (snd (partition f s)).
   Proof.
-    intros H_ok.
-    rewrite /partition /snd.
+    move => H_ok.
+    rewrite partition_alt_def /snd.
     by apply filter_ok.
   Qed.
 
   Lemma partition_spec1 :
    forall (s : t) (f : elt -> bool),
-   Proper (Enc.E.eq==>eq) f -> Equal (fst (partition f s)) (filter f s).
+   Equal (fst (partition f s)) (filter f s).
   Proof.
-    intros s f H_ok.
-    rewrite /partition /fst /Equal //.
+    intros s f.
+    rewrite partition_alt_def /fst /Equal //.
   Qed.
 
   Lemma partition_spec2 :
    forall (s : t) (f : elt -> bool),
-   Proper (Enc.E.eq==>eq) f ->
+   Ok s ->    
    Equal (snd (partition f s)) (filter (fun x => negb (f x)) s).
   Proof.
-    intros s f H_ok.
-    rewrite /partition /snd /Equal //.
+    intros s f.
+    rewrite partition_alt_def /snd /Equal //.
   Qed.
-
+  
 End Raw.
 
 
@@ -4637,7 +5656,7 @@ End Raw.
     We can now build the invariant into the set type to obtain an instantiation
     of module type [WSetsOn]. *)
 
-Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
+Module MSetIntervals (Enc : ElementEncode) <: SetsOn Enc.E.
   Module E := Enc.E.
   Module Raw := Raw Enc.
 
@@ -4670,7 +5689,10 @@ Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
  Definition empty : t := Mkt Raw.empty.
  Definition is_empty (s : t) := Raw.is_empty s.
  Definition elements (s : t) : list elt := Raw.elements s.
+ Definition min_elt (s : t) : option elt := Raw.min_elt s.
+ Definition max_elt (s : t) : option elt := Raw.max_elt s.
  Definition choose (s : t) : option elt := Raw.choose s.
+ Definition compare (s1 s2 : t) : comparison := Raw.compare s1 s2.
  Definition fold {A : Type}(f : elt -> A -> A)(s : t) : A -> A := Raw.fold f s.
  Definition cardinal (s : t) := Raw.cardinal s.
  Definition filter (f : elt -> bool)(s : t) : t := Mkt (Raw.filter f s).
@@ -4693,7 +5715,6 @@ Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
  Instance eq_equiv : Equivalence eq.
  Proof. firstorder. Qed.
 
-
  Definition eq_dec : forall (s s':t), { eq s s' }+{ ~eq s s' }.
  Proof.
   intros (s,Hs) (s',Hs').
@@ -4702,7 +5723,39 @@ Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
    rewrite <- Raw.equal_spec; congruence.
  Defined.
 
+ Definition lt : t -> t -> Prop := Raw.lt.
 
+ Instance lt_strorder : StrictOrder lt.
+ Proof.
+   unfold lt.
+   constructor. {
+     move : Raw.lt_Irreflexive.
+     rewrite /Irreflexive /complement /Reflexive.
+     move => H x.
+     apply H.
+   } {
+     move : Raw.lt_Transitive.
+     rewrite /Transitive.
+     move => H x y z.
+     apply H.
+   }
+ Qed.
+
+ Instance lt_compat : Proper (eq==>eq==>iff) lt.
+ Proof.
+   repeat red.
+   move => [x1 H_x1_ok] [y1 H_y1_ok] H_eq.
+   move => [x2 H_x2_ok] [y2 H_y2_ok].
+   move : H_eq.
+   rewrite /eq /lt /Equal /In /=.
+   replace (forall a : elt, Raw.In a x1 <-> Raw.In a y1) with
+     (Raw.Equal x1 y1) by done.
+   replace (forall a : elt, Raw.In a x2 <-> Raw.In a y2) with
+     (Raw.Equal x2 y2) by done.
+   rewrite -!Raw.equal_spec !Raw.equal_alt_def.
+   move => -> -> //.
+ Qed.
+ 
  Section Spec.
   Variable s s' : t.
   Variable x y : elt.
@@ -4738,7 +5791,7 @@ Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
   Proof. exact (@Raw.cardinal_spec s). Qed.
   Lemma filter_spec : compatb f ->
     (In x (filter f s) <-> In x s /\ f x = true).
-  Proof. exact (@Raw.filter_spec _ _ _). Qed.
+  Proof. move => _; exact (@Raw.filter_spec _ _ _ _). Qed.
   Lemma for_all_spec : compatb f ->
     (for_all f s = true <-> For_all (fun x => f x = true) s).
   Proof. exact (@Raw.for_all_spec _ _ _). Qed.
@@ -4746,19 +5799,60 @@ Module MSetIntervals (Enc : ElementEncode) <: WSetsOn Enc.E.
     (exists_ f s = true <-> Exists (fun x => f x = true) s).
   Proof. exact (@Raw.exists_spec _ _ _). Qed.
   Lemma partition_spec1 : compatb f -> Equal (fst (partition f s)) (filter f s).
-  Proof. exact (@Raw.partition_spec1 _ _). Qed.
+  Proof. move => _; exact (@Raw.partition_spec1 _ _). Qed.
   Lemma partition_spec2 : compatb f ->
       Equal (snd (partition f s)) (filter (fun x => negb (f x)) s).
-  Proof. exact (@Raw.partition_spec2 _ _). Qed.
+  Proof. move => _; exact (@Raw.partition_spec2 _ _ _). Qed.
   Lemma elements_spec1 : InA E.eq x (elements s) <-> In x s.
   Proof. rewrite /In /Raw.In /elements //. Qed.
   Lemma elements_spec2w : NoDupA E.eq (elements s).
   Proof. exact (Raw.elements_spec2w _ _). Qed.
+  Lemma elements_spec2 : sort E.lt (elements s).  
+  Proof. exact (Raw.elements_sorted _ _). Qed.
   Lemma choose_spec1 : choose s = Some x -> In x s.
   Proof. exact (Raw.choose_spec1 _ _ _). Qed.
   Lemma choose_spec2 : choose s = None -> Empty s.
   Proof. exact (Raw.choose_spec2 _). Qed.
+  Lemma choose_spec3 : choose s = Some x -> choose s' = Some y ->
+    Equal s s' -> E.eq x y.
+  Proof.
+    intros H1 H2 H3.
+    suff -> : x = y. {
+      apply E.eq_equiv.
+    }
+    move : H1 H2 H3.
+    exact (Raw.choose_spec3 _ _ _ _ _ _).
+  Qed.
 
+  Lemma min_elt_spec1 : choose s = Some x -> In x s.
+  Proof. exact (Raw.min_elt_spec1 _ _ _). Qed.
+  Lemma min_elt_spec2 : min_elt s = Some x -> In y s -> ~ E.lt y x.
+  Proof. exact (Raw.min_elt_spec2 _ _ _ _). Qed.
+  Lemma min_elt_spec3 : choose s = None -> Empty s.
+  Proof. exact (Raw.min_elt_spec3 _). Qed.
+  
+  Lemma max_elt_spec1 : max_elt s = Some x -> In x s.
+  Proof. exact (Raw.max_elt_spec1 _ _ _). Qed.
+  Lemma max_elt_spec2 : max_elt s = Some x -> In y s -> ~ E.lt x y.
+  Proof. exact (Raw.max_elt_spec2 _ _ _ _). Qed.
+  Lemma max_elt_spec3 : max_elt s = None -> Empty s.
+  Proof. exact (Raw.max_elt_spec3 _). Qed.
+
+  Lemma compare_spec : CompSpec eq lt s s' (compare s s').
+  Proof.
+    generalize s s'.
+    move => [s1 H_ok_s1] [s2 H_ok_s2].
+    move : (Raw.compare_spec s1 s2).
+    rewrite /CompSpec /eq /Equal /In /lt /compare /=.
+    replace (forall a : elt, Raw.In a s1 <-> Raw.In a s2) with
+    (Raw.Equal s1 s2) by done.
+    suff H_eq : (Raw.Equal s1 s2) <-> (s1 = s2). {
+      move => [] H; constructor => //.
+      by rewrite H_eq.
+    }
+    rewrite -Raw.equal_spec Raw.equal_alt_def //.
+  Qed.
+  
  End Spec.
 
 End MSetIntervals.
@@ -4785,10 +5879,14 @@ Module ElementEncodeZ <: ElementEncode.
     (Z.eq (encode e1) (encode e2)) <-> E.eq e1 e2.
   Proof. by []. Qed.
 
+  Lemma encode_lt : forall (e1 e2 : E.t),
+    (Z.lt (encode e1) (encode e2)) <-> E.lt e1 e2.
+  Proof. by []. Qed.
+  
 End ElementEncodeZ.
 
-Module MSetIntervalsZ <: WSetsOn Z := MSetIntervals ElementEncodeZ.
 
+Module MSetIntervalsZ <: SetsOn Z := MSetIntervals ElementEncodeZ.
 
 (** *** N *)
 
@@ -4811,9 +5909,17 @@ Module ElementEncodeN <: ElementEncode.
     intros e1 e2.
     rewrite /encode /Z.eq N2Z.inj_iff /E.eq //.
   Qed.
+
+  Lemma encode_lt : forall (e1 e2 : E.t),
+    (Z.lt (encode e1) (encode e2)) <-> E.lt e1 e2.
+  Proof.
+    intros e1 e2.
+    rewrite /encode -N2Z.inj_lt //.
+  Qed.
+
 End ElementEncodeN.
 
-Module MSetIntervalsN <: WSetsOn N := MSetIntervals ElementEncodeN.
+Module MSetIntervalsN <: SetsOn N := MSetIntervals ElementEncodeN.
 
 
 (** *** nat *)
@@ -4836,9 +5942,17 @@ Module ElementEncodeNat <: ElementEncode.
     intros e1 e2.
     rewrite /encode /Z.eq Nat2Z.inj_iff /E.eq //.
   Qed.
+
+  Lemma encode_lt : forall (e1 e2 : E.t),
+    (Z.lt (encode e1) (encode e2)) <-> E.lt e1 e2.
+  Proof.
+    intros e1 e2.
+    rewrite /encode -Nat2Z.inj_lt //.
+  Qed.
+
 End ElementEncodeNat.
 
-Module MSetIntervalsNat <: WSetsOn NPeano.Nat := MSetIntervals ElementEncodeNat.
+Module MSetIntervalsNat <: SetsOn NPeano.Nat := MSetIntervals ElementEncodeNat.
 
 
 
