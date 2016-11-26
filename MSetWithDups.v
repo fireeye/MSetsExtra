@@ -50,7 +50,7 @@
 *)
 
 Require Import Coq.MSets.MSetInterface.
-Require Import ssreflect. 
+Require Import mathcomp.ssreflect.ssreflect.
 
 (** ** WSetsOnWithDups
 

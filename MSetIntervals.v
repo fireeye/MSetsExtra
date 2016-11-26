@@ -42,7 +42,7 @@
 
 Require Import MSetInterface OrdersFacts OrdersLists.
 Require Import BinNat.
-Require Import ssreflect.
+Require Import mathcomp.ssreflect.ssreflect.
 Require Import NArith.
 Require Import ZArith.
 Require Import NOrder.
@@ -4723,8 +4723,6 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
       apply SortA_app with (eqA := Logic.eq). {
         apply eq_equivalence.
       } {
-        apply Z.lt_strorder.
-      } {
         apply elementsZ_single_sorted.
       } {
         by apply IH.
@@ -5924,7 +5922,7 @@ Module MSetIntervalsN <: SetsOn N := MSetIntervals ElementEncodeN.
 
 (** *** nat *)
 Module ElementEncodeNat <: ElementEncode.
-  Module E := NPeano.Nat.
+  Module E := Nat.
 
   Definition encode (n : nat) := Z.of_nat n.
   Definition decode (z : Z) := Z.to_nat z.
@@ -5952,7 +5950,7 @@ Module ElementEncodeNat <: ElementEncode.
 
 End ElementEncodeNat.
 
-Module MSetIntervalsNat <: SetsOn NPeano.Nat := MSetIntervals ElementEncodeNat.
+Module MSetIntervalsNat <: SetsOn Nat := MSetIntervals ElementEncodeNat.
 
 
 
