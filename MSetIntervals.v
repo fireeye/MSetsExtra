@@ -4536,7 +4536,6 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
   Proof.
     intros s.
     case s => //=.
-    split => //.
   Qed.
 
   Lemma compare_eq_Lt_nil_r : forall s,
