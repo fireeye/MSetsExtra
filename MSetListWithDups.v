@@ -34,7 +34,7 @@
 
 
 Require Export MSetInterface.
-Require Import ssreflect.
+Require Import mathcomp.ssreflect.ssreflect.
 Require Import List OrdersFacts OrdersLists.
 Require Import Sorting Permutation.
 Require Import MSetWithDups.

@@ -21,17 +21,26 @@ There are the following files
 
 - `readme.md` (this readme)
 - `LICENSE` (license information, LGPL 2.1)
+- `configure.sh` 
+- `_CoqProject` 
 - `Makefile` 
 - `doc/*` (high level documentation)
-- `coqdoc/*` (generated coqdoc documentation)
 
 
-The `Makefile` provided is set up to generate documentation as well as
-process Coq files. The default target `proof` just processes the Coq
-files. For convenience coqdoc and a pdf version of top-level
-documentation is part of the repository. If you want to rebuild them
-use target `doc` or target `all`.
+The `Makefile` is generated via `coq_makefile` from `_CoqProject`. This
+is performed by `configure.sh`.
 
+## OPAM
+
+This library is available as an opam package as `coq-msets-extra`. In
+order to use it, add the coq opam repository
+
+	opam repo add coq-released https://coq.inria.fr/opam/released
+	opam update
+
+Afterwards you can install this libaray via
+
+	opam install coq-msets-extra
 
 ## Interval Sets
 

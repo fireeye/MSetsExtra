@@ -29,7 +29,7 @@
 
 
 Require Export MSetInterface.
-Require Import ssreflect.
+Require Import mathcomp.ssreflect.ssreflect.
 Require Import MSetWithDups.
 Require Import Int.
 Require Import MSetGenTree MSetAVL MSetRBT. 
