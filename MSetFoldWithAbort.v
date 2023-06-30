@@ -861,7 +861,7 @@ End SetsWithFoldA.
 (** *** GenTree implementation 
     Finally, provide such a fold with abort operation for generic trees. *)
 Module MakeGenTreeFoldA (Import E : OrderedType) (Import I:InfoTyp) 
-  (Import Raw:Ops E I)
+  (Import Raw: MSetGenTree.Ops E I)
   (M : MSetGenTree.Props E I Raw).
 
   Fixpoint foldWithAbort_Raw {A B: Type} (f_pre : E.t -> B) f_lt (f: E.t -> B -> A -> A) f_gt t (base: A) : A :=
@@ -926,7 +926,7 @@ Module MakeGenTreeFoldA (Import E : OrderedType) (Import I:InfoTyp)
          M.bst l /\ M.bst r /\ M.lt_tree e l /\ M.gt_tree e r. {
          inversion H_bst. done.
        }
-       
+
        have H_sub_l : (forall e0 : E.t, M.In e0 l -> M.In e0 s /\ E.lt e0 e). {
          intros e0 H_in_l.
          split; last by apply H_lt_tree_l. 
@@ -934,7 +934,7 @@ Module MakeGenTreeFoldA (Import E : OrderedType) (Import I:InfoTyp)
          rewrite /M.In M.In_node_iff.
          tauto.
        }
-       move : (IHl H_bst_l) => {IHl} IHl {H_bst_l} {H_lt_tree_l}.
+       move : (IHl H_bst_l) => {} IHl {H_bst_l} {H_lt_tree_l}.
        have H_sub_r : (forall e0 : E.t, M.In e0 r -> M.In e0 s /\ E.lt e e0). {
          intros e0 H_in_r.
          split; last by apply H_gt_tree_r. 
@@ -942,7 +942,7 @@ Module MakeGenTreeFoldA (Import E : OrderedType) (Import I:InfoTyp)
          rewrite /M.In M.In_node_iff.
          tauto.
        }
-       move : (IHr H_bst_r) => {IHr} IHr {H_bst_r} {H_gt_tree_r}.
+       move : (IHr H_bst_r) => {} IHr {H_bst_r} {H_gt_tree_r}.
        have H_in_e : M.In e s. {
          eapply H_sub.
          rewrite /M.In M.In_node_iff.

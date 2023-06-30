@@ -46,6 +46,7 @@ Require Import mathcomp.ssreflect.ssreflect.
 Require Import NArith.
 Require Import ZArith.
 Require Import NOrder.
+Require Import Lia.
 Require Import DecidableTypeEx.
 Module Import NOP := NOrderProp N.
 Open Scope Z_scope.
@@ -715,8 +716,6 @@ Module Raw (Enc : ElementEncode).
   Section ForNotations.
 
     Class Ok (s:t) : Prop := ok : IsOk s.
-    Hint Resolve @ok.
-    Hint Unfold Ok.
     Instance IsOk_Ok s `(Hs : IsOk s) : Ok s := { ok := Hs }.
 
     Definition In x s := (SetoidList.InA Enc.E.eq x (elements s)).
@@ -792,14 +791,14 @@ Module Raw (Enc : ElementEncode).
     induction c as [| c' IH] using N.peano_ind. {
       intros y x.
       rewrite elementsZ_single_base Z.add_0_r /=.
-      omega.
+      lia.
     } {
       intros y x.
       rewrite elementsZ_single_succ in_app_iff IH /= N2Z.inj_succ Z.add_succ_r Z.lt_succ_r.
       split. {
         move => [ | []] //. { 
           move => [H_x_le H_y_le]. 
-          omega.
+          lia.
         } {
           move => <-.
           split.
@@ -808,7 +807,7 @@ Module Raw (Enc : ElementEncode).
         }
       } {
         move => [H_x_le] H_y_lt.
-        omega.
+        lia.
       }
     }
   Qed.
@@ -819,7 +818,7 @@ Module Raw (Enc : ElementEncode).
   Proof.
     intros y x.
     rewrite In_elementsZ_single /= Z.add_1_r Z.lt_succ_r. 
-    omega.
+    lia.
   Qed.
 
   Lemma length_elementsZ_single : forall cx x,
@@ -1490,11 +1489,18 @@ Module Raw (Enc : ElementEncode).
       (forall x, InZ x s -> y < x)).
   Proof.
     intros s y H.
+
     rewrite interval_list_elements_greater_alt_def //.
-    firstorder.
-    apply Z.nle_gt.
-    move => H_lt.
-    eapply H0; eauto.
+    split. {
+      move => H_notInZ x H_inZ.
+      apply Z.nle_gt.
+      move => H_lt.
+      move : (H_notInZ x H_lt H_inZ) => //.
+    } {
+      move => H_lt x H_le H_inZ.
+      move : (H_lt x H_inZ).
+      lia.
+    }
   Qed.
 
   Lemma interval_list_elements_greater_intro : forall s y,
@@ -1838,7 +1844,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
     intros x c1 c2.
     rewrite /merge_interval_size.
     replace (x + Z.of_N c1 + Z.of_N c2 - x) with
-            (Z.of_N c1 + Z.of_N c2) by omega.
+            (Z.of_N c1 + Z.of_N c2) by lia.
     rewrite -N2Z.inj_add N2Z.id.
     apply N.max_r, N.le_add_r.
   Qed.
@@ -1853,7 +1859,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
       by apply Zle_minus_le_0.
     }
     rewrite -Z.add_max_distr_l.
-    replace (y1 + (y2 + Z.of_N c2 - y1)) with (y2 + Z.of_N c2) by omega.
+    replace (y1 + (y2 + Z.of_N c2 - y1)) with (y2 + Z.of_N c2) by lia.
     done.
   Qed.
 
@@ -2003,7 +2009,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
       firstorder.
     } {
       move => /interval_list_invariant_cons [H_greater] [H_c_neq_0] H_inv_c'.
-      move : (IH H_inv_c') => {IH} IH.
+      move : (IH H_inv_c') => {} IH.
       rewrite addZ_alt_def.
       have H_succ : forall z, z + Z.of_N 1 = Z.succ z by done.
       move : (interval_1_compare_elim x z c).      
@@ -2051,7 +2057,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
     } {
       move => /interval_list_invariant_cons [H_greater] [H_c_neq_0]
               H_inv_c'.
-      move : (IH H_inv_c') => {IH} IH.
+      move : (IH H_inv_c') => {} IH.
       rewrite addZ_alt_def.
       have H_succ : forall z, z + Z.of_N 1 = Z.succ z by done.
       move : (interval_1_compare_elim x z c).      
@@ -2128,7 +2134,8 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
     have Hs' := (add_ok s x Hs).
     rewrite !In_InZ.
     rewrite /add addZ_InZ. {
-      rewrite -Enc.encode_eq; firstorder.
+      rewrite -Enc.encode_eq /Z.eq.
+      firstorder. 
     } {
       apply Hs.
     }
@@ -2337,13 +2344,13 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         rewrite !interval_list_invariant_cons.
         move => [H_gr_l1] [H_c1_neq_0] H_inv_l1.
         move => [H_gr_l2] [H_c2_neq_0] H_inv_l2.
-        move : (IH2 H_inv_s1 H_inv_l2) => {IH2} IH2.
+        move : (IH2 H_inv_s1 H_inv_l2) => {} IH2.
         have :  forall s2 : t,
           interval_list_invariant s2 = true ->
           forall y : Z, InZ y (union l1 s2) <-> InZ y l1 \/ InZ y s2. {
           intros. by apply IH1.
         }
-        move => {IH1} IH1 y.
+        move => {} IH1 y.
         rewrite union_alt_def.
         move : (interval_compare_elim y1 c1 y2 c2).
         case (interval_compare (y1, c1) (y2, c2)). {
@@ -2440,7 +2447,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           }
           rewrite !In_elementsZ_single.
           move => [H_y1_le H_y_lt].
-          split; omega.
+          split; lia.
         } {
           move => [H_y1_le] [H_y2_c2_le] _.
           rewrite IH2.
@@ -2451,7 +2458,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           }
           rewrite !In_elementsZ_single.
           move => [H_y2_le H_y_lt].
-          split; omega.
+          split; lia.
         } {
           rewrite !InZ_cons IH2 !InZ_cons.
           tauto.
@@ -2508,13 +2515,13 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         rewrite !interval_list_invariant_cons.
         move => [H_gr_l1] [H_c1_neq_0] H_inv_l1.
         move => [H_gr_l2] [H_c2_neq_0] H_inv_l2.
-        move : (IH2 H_inv_s1 H_inv_l2) => {IH2} IH2.
+        move : (IH2 H_inv_s1 H_inv_l2) => {} IH2.
         have :  forall s2 : t,
           interval_list_invariant s2 = true ->
           interval_list_invariant (union l1 s2) = true. {
           intros. by apply IH1.
         }
-        move => {IH1} IH1.
+        move => {} IH1.
 
         rewrite union_alt_def.
         move : (interval_compare_elim y1 c1 y2 c2).
@@ -2792,8 +2799,8 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           }
         } 
       }
-      move => {IH} IH.
-         
+      move => {} IH.
+
       clear H_inv_acc H_in_acc_lt acc.
       move : (interval_compare_elim y1 c1 y2 c2) H_inter_aux_eq.
       unfold inter_aux.
@@ -2806,7 +2813,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           move => x.
           rewrite InZ_nil.
           split => //.
-          omega.
+          lia.
         } {
           apply Z.le_trans with (m := y2). {
             by apply Z.lt_le_incl.
@@ -2822,7 +2829,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           move => x.
           rewrite InZ_nil.
           split => //.
-          omega.
+          lia.
         } {
           rewrite H_eq_y2.
           apply Z_le_add_r.
@@ -2834,9 +2841,9 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           by apply Z_to_N_minus_neq_0.
         } {
           move => x.
-          rewrite InZ_cons InZ_nil In_elementsZ_single Z2N.id; last omega.
-          replace (y1 + (y2 - y1)) with y2 by omega.
-          split; omega.
+          rewrite InZ_cons InZ_nil In_elementsZ_single Z2N.id; last lia.
+          replace (y1 + (y2 - y1)) with y2 by lia.
+          split; lia.
         } {
           by apply Z.lt_le_incl.
         }
@@ -2850,15 +2857,15 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           move => y.
           have H_yc2_intro : y1 + Z.of_N (Z.to_N (y2 + Z.of_N c2 - y1)) =
                              y2 + Z.of_N c2. {
-            rewrite Z2N.id; omega.
+            rewrite Z2N.id; lia.
           }       
           
           rewrite !InZ_cons !In_elementsZ_single InZ_nil H_yc2_intro.
           split. {
             move => [] //.
             move => [H_y1_le] H_y_lt.
-            split; last by omega.
-            left. omega.
+            split; last by lia.
+            left. lia.
           } {
             move => [H_in_s] [H_y2_le] H_y_lt.
             left.
@@ -2921,7 +2928,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             move => [] //.
             move => [H_y1_le] H_y_lt.
             split; first done.
-            split; omega.
+            split; lia.
           } {
             move => [?] _.
             by left.
@@ -2941,8 +2948,8 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           split. {
             move => [] //.
             move => [H_y2_le] H_y_lt.
-            split; last by omega.
-            left. omega.
+            split; last by lia.
+            left. lia.
           } {
             move => [H_in_s] [H_y2_le] H_y_lt.
             by left.
@@ -2966,14 +2973,14 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           move => [] []. {
             move => [H_y1_le_y] H_y_lt_yc1.
             move => [H_y2_le_y] H_y_lt_yc2.
-            omega.
+            lia.
           } {
             move => /H_gr_s1'_alt H_lt_y [_] H_y_lt.
             suff : (y1 + Z.of_N c1 < y1). {
               apply Z.nlt_ge.
               apply Z_le_add_r.
             }
-            omega.
+            lia.
           }
         } {
           tauto.
@@ -2994,14 +3001,14 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           move => [] []. {
             move => [H_y1_le_y] H_y_lt_yc1.
             move => [H_y2_le_y] H_y_lt_yc2.
-            omega.
+            lia.
           } {
             move => /H_gr_s1'_alt H_lt_y [_] H_y_lt.
             suff : (y1 + Z.of_N c1 < y1). {
               apply Z.nlt_ge.
               apply Z_le_add_r.
             }
-            omega.
+            lia.
           }
         } {
           tauto.
@@ -3348,11 +3355,11 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             split; last by assumption.
             move : H_in => [] H_in; last by right.
             left.
-            omega.
+            lia.
           }
         }
       }
-      move => {IH} IH.
+      move => {} IH.
        
       clear H_inv_acc H_in_s1 H_in_acc acc.
       move : (interval_compare_elim y1 c1 y2 c2) H_diff_aux_eq.
@@ -3396,8 +3403,8 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           by apply Z_to_N_minus_neq_0.
         } {
           move => x.
-          rewrite InZ_cons In_elementsZ_single Z2N.id; last omega.
-          replace (y1 + (y2 - y1)) with y2 by omega.
+          rewrite InZ_cons In_elementsZ_single Z2N.id; last lia.
+          replace (y1 + (y2 - y1)) with y2 by lia.
           split; last tauto.
           move => [] //.
           move => [H_y1_le] H_x_lt.
@@ -3412,7 +3419,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         clear IH P1 P2 P3 H_comp.
         subst.
         have H_yc1_intro : y2 + Z.of_N c2 + Z.of_N (Z.to_N (y1 + Z.of_N c1 - (y2 + Z.of_N c2))) = y1 + Z.of_N c1. {
-          rewrite Z2N.id; omega.
+          rewrite Z2N.id; lia.
         }
         have H_nin_yc2 : forall y,
             InZ y s1' -> ~ y2 <= y < y2 + Z.of_N c2. {
@@ -3429,7 +3436,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             move => []. {
               move => [H_le_y] H_y_lt.
               split. {
-                left; omega.
+                left; lia.
               } {
                 move => [_].
                 by apply Z.nlt_ge.
@@ -3440,7 +3447,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
           } {
             move => [] []; last by right; right.
             move => [H_y_ge] H_y_lt_yc1 H_nin_yc2'.
-            right; left. omega.
+            right; left. lia.
           }
         } {
           rewrite interval_list_invariant_cons H_yc1_intro.
@@ -3477,7 +3484,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         } {
           move => x.
           split; first done.
-          omega.
+          lia.
         } {
           assumption.
         }
@@ -3487,10 +3494,10 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         clear IH P1 P2 P3 H_comp.
         subst.
         have H_yc1_intro : y2 + Z.of_N c2 + Z.of_N (Z.to_N (y1 + Z.of_N c1 - (y2 + Z.of_N c2))) = y1 + Z.of_N c1. {
-          rewrite Z2N.id; omega.
+          rewrite Z2N.id; lia.
         }       
         have H_y1_intro : y1 + Z.of_N (Z.to_N (y2 - y1)) = y2. {
-          rewrite Z2N.id; omega.
+          rewrite Z2N.id; lia.
         }              
         split; last split. {
           move => y.
@@ -3589,10 +3596,10 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             split; first assumption.
             rewrite In_elementsZ_single.
             move => [] H_y2_le H_y_lt.
-            case H_y_in; first by omega.
+            case H_y_in; first by lia.
             move => /H_gr_s1'_alt H_lt_y.
             suff : y2 + Z.of_N c2 < y. {
-              move => ?. omega.
+              move => ?. lia.
             }
             apply Z.lt_trans with (m := y1 + Z.of_N c1) => //.
             apply Z.lt_le_trans with (m := y1) => //.
@@ -3617,10 +3624,10 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             split; first assumption.
             rewrite In_elementsZ_single.
             move => [] H_y2_le H_y_lt.
-            case H_y_in; first by omega.
+            case H_y_in; first by lia.
             move => /H_gr_s1'_alt H_lt_y.
             suff : y2 + Z.of_N c2 < y. {
-              move => ?. omega.
+              move => ?. lia.
             }
             apply Z.lt_trans with (m := (y2 + Z.of_N c2) + Z.of_N c1) => //. 
             by apply Z_lt_add_r.
@@ -3885,7 +3892,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
       }
       move : (H_y2_nlt) (H_y2_lt) => /Z.ltb_nlt -> /Z.ltb_lt ->.
 
-      have H_y1_eq : (y1 = y2) by omega.
+      have H_y1_eq : (y1 = y2) by lia.
       have H_yc1_eq : (y1 + Z.of_N c1 = Z.succ y2). {
         apply Z.le_antisymm. {
           move : H_yc1_le.
@@ -4130,7 +4137,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         move => [_] [H_c1_neq_0] _ _.        
         split => //.
         move => H; move : (H y1).
-        rewrite InZ_nil => {H} H.
+        rewrite InZ_nil => {} H.
         contradict H.
         rewrite InZ_cons; left.
         by apply In_elementsZ_single_hd.
@@ -4140,14 +4147,14 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         rewrite !interval_list_invariant_cons.
         move => [H_gr_l1] [H_c1_neq_0] H_inv_l1.
         move => [H_gr_l2] [H_c2_neq_0] H_inv_l2.
-        move : (IH2 H_inv_s1 H_inv_l2) => {IH2} IH2.
+        move : (IH2 H_inv_s1 H_inv_l2) => {} IH2.
         have :  forall s2 : t,
           interval_list_invariant s2 = true ->
           (subset l1 s2 = true <->
           (forall y : Z, InZ y l1 -> InZ y s2)). {
           intros. by apply IH1.
         }
-        move => {IH1} IH1.
+        move => {} IH1.
 
         have H_yc2_nin : ~ InZ (y2 + Z.of_N c2) ((y2, c2) :: l2). {
           rewrite !InZ_cons !In_elementsZ_single.
@@ -4209,7 +4216,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             rewrite !In_elementsZ_single.
             move => [H_y1_le] H_y_lt.
             left.
-            omega.
+            lia.
           } {
             move => H_pre H_y_in_l1.
             apply H_pre.
@@ -4246,7 +4253,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
             move => [H_y2_le H_y_lt].
             move : H_y_in => []. {
               move => [H_y1_le] H_y_lt'.
-              omega.
+              lia.
             } {
               eapply Nin_elements_greater; eauto.
               apply Z.le_trans with (m := y1); last first. {
@@ -4598,10 +4605,10 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
         move => /Z.lt_asymm //.
       } {
         move => [] H_y1_eq.
-        exfalso. omega.
+        exfalso. lia.
       } {
         move => [] H_y1_eq.
-        exfalso. omega.
+        exfalso. lia.
       }
     }
   Qed.
@@ -4946,7 +4953,7 @@ Lemma elementsZ_insert_intervalZ_guarded : forall x c s,
       case s' as [| [y' c'] s'']. {
         move => [<-].
         rewrite InZ_cons InZ_nil In_elementsZ_single.
-        omega.
+        lia.
       } {
         move => H_max_eq.
         rewrite InZ_cons.
@@ -5665,7 +5672,7 @@ Module MSetIntervals (Enc : ElementEncode) <: SetsOn Enc.E.
  Record t_ := Mkt {this :> Raw.t; is_ok : Raw.Ok this}.
  Definition t := t_.
  Arguments Mkt this {is_ok}.
- Hint Resolve is_ok : typeclass_instances.
+ #[local] Hint Resolve is_ok : typeclass_instances.
 
  Definition In (x : elt)(s : t) := Raw.In x s.(this).
  Definition Equal (s s' : t) := forall a : elt, In a s <-> In a s'.
@@ -5698,7 +5705,7 @@ Module MSetIntervals (Enc : ElementEncode) <: SetsOn Enc.E.
  Definition partition (f : elt -> bool)(s : t) : t * t :=
    let p := Raw.partition f s in (Mkt (fst p), Mkt (snd p)).
 
- Instance In_compat : Proper (E.eq==>eq==>iff) In.
+ #[local] Instance In_compat : Proper (E.eq==>eq==>iff) In.
  Proof. 
    repeat red.
    move => x y H_eq_xy x' y' ->.
@@ -5709,7 +5716,7 @@ Module MSetIntervals (Enc : ElementEncode) <: SetsOn Enc.E.
 
  Definition eq : t -> t -> Prop := Equal.
 
- Instance eq_equiv : Equivalence eq.
+ #[local] Instance eq_equiv : Equivalence eq.
  Proof. firstorder. Qed.
 
  Definition eq_dec : forall (s s':t), { eq s s' }+{ ~eq s s' }.
@@ -5722,7 +5729,7 @@ Module MSetIntervals (Enc : ElementEncode) <: SetsOn Enc.E.
 
  Definition lt : t -> t -> Prop := Raw.lt.
 
- Instance lt_strorder : StrictOrder lt.
+ #[local] Instance lt_strorder : StrictOrder lt.
  Proof.
    unfold lt.
    constructor. {
@@ -5738,7 +5745,7 @@ Module MSetIntervals (Enc : ElementEncode) <: SetsOn Enc.E.
    }
  Qed.
 
- Instance lt_compat : Proper (eq==>eq==>iff) lt.
+ #[local] Instance lt_compat : Proper (eq==>eq==>iff) lt.
  Proof.
    repeat red.
    move => [x1 H_x1_ok] [y1 H_y1_ok] H_eq.

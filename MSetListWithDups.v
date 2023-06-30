@@ -325,8 +325,7 @@ Module RemoveDupsFromSorted (Import X:OrderedType).
       rewrite !InA_alt.
       setoid_rewrite H_in_sort => //.
     } {
-
-      move : (LocallySorted_sort l).
+      move : (Sorted_sort l).
       rewrite /is_true /le /leb //.
     }
   Qed.
@@ -447,7 +446,7 @@ Module Make (E:OrderedType) <: WSetsOnWithDupsExtra E.
   (** Logical predicates *)
   Definition In x (s : t) := SetoidList.InA E.eq x s.
 
-  Instance In_compat : Proper (E.eq==>eq==>iff) In.
+  #[local] Instance In_compat : Proper (E.eq==>eq==>iff) In.
   Proof. repeat red. intros. rewrite H H0. auto. Qed.
 
   Definition Equal s s' := forall a : elt, In a s <-> In a s'.
@@ -489,9 +488,9 @@ Module Make (E:OrderedType) <: WSetsOnWithDupsExtra E.
       case (E.compare x y). {
         tauto.
       } {
-        rewrite IH; intuition; inversion H.
+        rewrite IH; intuition; inversion H1.
       } {
-        rewrite IH; intuition; inversion H.
+        rewrite IH; intuition; inversion H1.
       } 
     }
  Qed.
@@ -569,10 +568,6 @@ Module Make (E:OrderedType) <: WSetsOnWithDupsExtra E.
       by left.
     }
   Qed.       
-
-  Hint Resolve (@Equivalence_Reflexive _ _ E.eq_equiv).
-  Hint Immediate (@Equivalence_Symmetric _ _ E.eq_equiv).
-  Hint Resolve (@Equivalence_Transitive _ _ E.eq_equiv).
 
   Lemma rev_filter_aux_spec : forall s acc x f, compatb f ->
     (In x (rev_filter_aux acc f s) <-> (In x s /\ f x = true) \/ (In x acc)).
@@ -717,7 +712,7 @@ Module Make (E:OrderedType) <: WSetsOnWithDupsExtra E.
         }
         apply H.
         apply InA_cons_hd.
-        done.
+        apply (@Equivalence_Reflexive _ _ E.eq_equiv).
       }
     }
   Qed.
@@ -738,7 +733,7 @@ Module Make (E:OrderedType) <: WSetsOnWithDupsExtra E.
         exists x.
         split => //.
         apply InA_cons_hd.
-        done.
+        apply (@Equivalence_Reflexive _ _ E.eq_equiv).
       } {
         rewrite IH.
         split. {

@@ -67,7 +67,7 @@ Module Type WSetsOnWithDups (E : DecidableType).
   Include WOps E.
 
   Parameter In : elt -> t -> Prop.
-  Declare Instance In_compat : Proper (E.eq==>eq==>iff) In.
+  #[local] Declare Instance In_compat : Proper (E.eq==>eq==>iff) In.
 
   Definition Equal s s' := forall a : elt, In a s <-> In a s'.
   Definition Subset s s' := forall a : elt, In a s -> In a s'.
